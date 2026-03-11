@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Claw — Personal AI Companion powered by agent-sdk"
+license = "MIT"
+repository = "https://github.com/piyanggoon/claw-agent-rs"
+homepage = "https://github.com/piyanggoon/claw-agent-rs"
+keywords = ["ai", "agent", "companion", "llm", "rust"]
+categories = ["web-programming", "command-line-utilities"]
 
 [dependencies]
 # Core agent SDK
