@@ -61,6 +61,7 @@ fn build_test_context(tmp: &TempDir) -> (ClawContext, broadcast::Receiver<Notifi
         pending_questions,
         session_id: Some("test-session-001".to_string()),
         config,
+        custom_event_tx: None,
     };
 
     (ctx, notification_rx, chat_rx)

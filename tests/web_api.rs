@@ -36,17 +36,26 @@ fn setup_app() -> (TempDir, axum::Router) {
     let (notification_tx, _) = broadcast::channel::<NotificationEvent>(64);
     let (chat_tx, _) = broadcast::channel::<ChatMessageEvent>(64);
 
+    let (task_events_tx, _) = broadcast::channel::<serde_json::Value>(64);
+
+    // Ensure auth is disabled in tests so all routes are accessible
+    let mut config = ClawConfig::from_env();
+    config.auth_enabled = false;
+
     let state = AppState {
         db: db_conn,
         soul,
         memory,
-        config: Arc::new(ClawConfig::from_env()),
+        config: Arc::new(config),
         scheduler: Arc::new(SchedulerHandle::new()),
         active_runs: Arc::new(DashMap::new()),
         abort_handles: Arc::new(DashMap::new()),
         notification_tx,
         chat_tx,
         pending_questions: Arc::new(DashMap::new()),
+        run_sessions: Arc::new(DashMap::new()),
+        custom_events: Arc::new(DashMap::new()),
+        task_events_tx,
     };
 
     let router = build_router(state);
@@ -76,8 +85,8 @@ async fn list_sessions_empty() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    let sessions: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
-    assert!(sessions.is_empty());
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(parsed["sessions"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -133,12 +142,13 @@ async fn read_soul_file() {
 async fn write_soul_file() {
     let (_tmp, app) = setup_app();
 
-    // Write
+    // Write (now JSON body with "content" field)
+    let write_body = json!({"content": "# Tools\n- OS: macOS\n"});
     let response = app.clone()
         .oneshot(
             Request::put("/api/soul/TOOLS.md")
-                .header("content-type", "text/plain")
-                .body(Body::from("# Tools\n- OS: macOS\n"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&write_body).unwrap()))
                 .unwrap(),
         )
         .await
@@ -160,7 +170,7 @@ async fn write_soul_file() {
 async fn chat_respond_to_missing_question() {
     let (_tmp, app) = setup_app();
 
-    let body = json!({"question_id": "nonexistent", "answer": "test"});
+    let body = json!({"question_id": "nonexistent", "response": "test"});
     let response = app
         .oneshot(
             Request::post("/api/chat/respond")
@@ -176,10 +186,12 @@ async fn chat_respond_to_missing_question() {
 #[tokio::test]
 async fn stop_missing_run() {
     let (_tmp, app) = setup_app();
+    let body = json!({"runId": "nonexistent-run-id"});
     let response = app
         .oneshot(
-            Request::post("/api/chat/stop/nonexistent-run-id")
-                .body(Body::empty())
+            Request::post("/api/chat/stop")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).unwrap()))
                 .unwrap(),
         )
         .await

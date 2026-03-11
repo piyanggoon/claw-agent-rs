@@ -239,6 +239,7 @@ impl Tool<ClawContext> for AskUserTool {
         input: Value,
     ) -> impl Future<Output = anyhow::Result<ToolResult>> + Send {
         let chat_tx = ctx.app.chat_tx.clone();
+        let custom_event_tx = ctx.app.custom_event_tx.clone();
         let pending_questions = ctx.app.pending_questions.clone();
         let session_id = ctx.app.session_id.clone();
 
@@ -258,7 +259,7 @@ impl Tool<ClawContext> for AskUserTool {
 
             let question_id = Uuid::new_v4().to_string();
 
-            // Build the question payload and broadcast it as a chat message
+            // Build the question payload
             let payload = json!({
                 "type": "ask_user",
                 "question_id": question_id,
@@ -266,13 +267,18 @@ impl Tool<ClawContext> for AskUserTool {
                 "options": options,
             });
 
-            let target_session = session_id.unwrap_or_else(|| "default".to_string());
-
-            let event = ChatMessageEvent {
-                session_id: target_session,
-                content: payload.to_string(),
-            };
-            let _ = chat_tx.send(event);
+            // Send via custom_event_tx if available (injects directly into SSE stream),
+            // otherwise fall back to chat_tx broadcast
+            if let Some(custom_tx) = &custom_event_tx {
+                let _ = custom_tx.send(payload);
+            } else {
+                let target_session = session_id.unwrap_or_else(|| "default".to_string());
+                let event = ChatMessageEvent {
+                    session_id: target_session,
+                    content: payload.to_string(),
+                };
+                let _ = chat_tx.send(event);
+            }
 
             // Create a oneshot channel and register it for the web handler to resolve
             let (tx, rx) = oneshot::channel::<String>();

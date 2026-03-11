@@ -1,72 +1,107 @@
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
-use serde::Serialize;
+use serde::Deserialize;
+use serde_json::json;
 
-use crate::db::messages;
-use crate::db::sessions;
+use crate::db::{messages, sessions};
 use crate::web::state::AppState;
 
-// ── Response types ───────────────────────────────────────────────────────────
-
-#[derive(Serialize)]
-pub struct SessionWithMessages {
-    #[serde(flatten)]
-    pub session: sessions::WebSession,
-    pub messages: Vec<messages::StoredMessage>,
+#[derive(Deserialize)]
+pub struct RenameRequest {
+    pub title: String,
 }
 
-// ── Handlers ─────────────────────────────────────────────────────────────────
-
-/// GET /api/sessions
-///
-/// Returns all web sessions ordered by most recently active first.
+/// GET /api/sessions → { sessions: [...] }
 pub async fn list_sessions(
     State(state): State<AppState>,
-) -> Result<Json<Vec<sessions::WebSession>>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let db = state.db.lock().await;
     let result = sessions::get_sessions(&db)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(result))
+    let enriched: Vec<serde_json::Value> = result.iter().map(|s| {
+        let count = messages::count_messages(&db, &s.id).unwrap_or(0);
+        json!({
+            "id": s.id,
+            "title": s.title,
+            "summary": s.summary,
+            "created_at": s.created_at,
+            "last_message_at": s.last_message_at,
+            "message_count": count,
+        })
+    }).collect();
+    Ok(Json(json!({"sessions": enriched})))
 }
 
 /// GET /api/sessions/:id
-///
-/// Returns a single session along with all its messages.
 pub async fn get_session(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<SessionWithMessages>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let db = state.db.lock().await;
-
     let session = sessions::get_session(&db, &id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, format!("session {id} not found")))?;
-
     let msgs = messages::get_messages_by_session(&db, &id, None, None)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let count = messages::count_messages(&db, &id).unwrap_or(0);
+    Ok(Json(json!({
+        "id": session.id,
+        "title": session.title,
+        "summary": session.summary,
+        "created_at": session.created_at,
+        "last_message_at": session.last_message_at,
+        "message_count": count,
+        "messages": msgs,
+    })))
+}
 
-    Ok(Json(SessionWithMessages {
-        session,
-        messages: msgs,
-    }))
+/// PATCH /api/sessions/:id — rename
+pub async fn rename_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<RenameRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let db = state.db.lock().await;
+    sessions::update_session_title(&db, &id, &body.title)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let session = sessions::get_session(&db, &id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, format!("session {id} not found")))?;
+    let count = messages::count_messages(&db, &id).unwrap_or(0);
+    Ok(Json(json!({
+        "session": {
+            "id": session.id,
+            "title": session.title,
+            "summary": session.summary,
+            "created_at": session.created_at,
+            "last_message_at": session.last_message_at,
+            "message_count": count,
+        }
+    })))
+}
+
+/// DELETE /api/sessions — delete all
+pub async fn delete_all_sessions(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let db = state.db.lock().await;
+    db.execute("DELETE FROM messages", [])
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    db.execute("DELETE FROM web_sessions", [])
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(json!({"ok": true})))
 }
 
 /// DELETE /api/sessions/:id
-///
-/// Deletes a session and all of its associated messages.
 pub async fn delete_session(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<StatusCode, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let db = state.db.lock().await;
-
-    // Delete messages first to satisfy foreign-key-like semantics.
     messages::delete_messages_by_session(&db, &id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
     sessions::delete_session(&db, &id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    Ok(StatusCode::OK)
+    Ok(Json(json!({"ok": true})))
 }

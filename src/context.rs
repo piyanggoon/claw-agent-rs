@@ -42,4 +42,8 @@ pub struct ClawContext {
     /// The web session that initiated the current agent run, if any.
     pub session_id: Option<String>,
     pub config: Arc<ClawConfig>,
+    /// Optional broadcast sender for injecting custom SSE events
+    /// (e.g., ask_user questions) directly into the frontend's SSE stream.
+    /// Set when running via web chat, `None` for background/scheduled tasks.
+    pub custom_event_tx: Option<broadcast::Sender<serde_json::Value>>,
 }

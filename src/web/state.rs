@@ -53,4 +53,13 @@ pub struct AppState {
     /// The web handler resolves the question by sending the user's answer
     /// through the contained `oneshot::Sender`.
     pub pending_questions: Arc<DashMap<String, oneshot::Sender<String>>>,
+
+    /// Maps `run_id` -> `session_id` for chat status reporting.
+    pub run_sessions: Arc<DashMap<String, String>>,
+
+    /// Custom SSE event channels per run (for ask_user, plan_update, etc.).
+    pub custom_events: Arc<DashMap<String, broadcast::Sender<serde_json::Value>>>,
+
+    /// Broadcast channel for real-time task lifecycle events (SSE to frontend).
+    pub task_events_tx: broadcast::Sender<serde_json::Value>,
 }

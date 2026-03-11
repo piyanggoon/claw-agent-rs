@@ -3,6 +3,7 @@ use agent_sdk::{
     builder, AgentConfig, AgentEvent, AgentEventEnvelope, AgentInput, AgentRunState,
     ThreadId, ToolContext, ToolRegistry,
 };
+use serde_json::json;
 
 use crate::context::ClawContext;
 use crate::db::stores::{SqliteMessageStore, SqliteStateStore};
@@ -11,19 +12,31 @@ use crate::tools::register_all_tools;
 use crate::soul::prompt::build_system_prompt;
 use crate::agent::provider::create_provider;
 
-/// Run an agent with the given prompt. Returns the run_id.
-/// This spawns a tokio task that:
+/// Result of an agent run with accumulated output data.
+pub struct RunResult {
+    pub accumulated_text: String,
+    pub tool_calls: Vec<serde_json::Value>,
+    pub total_turns: usize,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub duration_ms: u64,
+}
+
+/// Run an agent with the given prompt.
+///
+/// This:
 /// 1. Builds system prompt from soul files
 /// 2. Creates ToolRegistry with all custom tools
 /// 3. Creates AgentLoop via builder
 /// 4. Runs the agent and forwards events
+/// 5. Returns accumulated text and metadata
 pub async fn run_agent(
     ctx: ClawContext,
     thread_id: ThreadId,
     message: String,
     model: Option<String>,
     event_tx: broadcast::Sender<AgentEventEnvelope>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<RunResult> {
     let config = ctx.config.clone();
     let model_name = model.unwrap_or_else(|| config.default_model.clone());
 
@@ -81,8 +94,45 @@ pub async fn run_agent(
         tool_ctx,
     );
 
-    // Forward events to broadcast channel
+    // Forward events to broadcast channel while accumulating text/metadata
+    let mut accumulated_text = String::new();
+    let mut tool_calls: Vec<serde_json::Value> = Vec::new();
+    let mut result_meta: Option<(usize, u32, u32, u64)> = None;
+
     while let Some(envelope) = events.recv().await {
+        // Accumulate data from events
+        match &envelope.event {
+            AgentEvent::TextDelta { delta, .. } => {
+                accumulated_text.push_str(delta);
+            }
+            AgentEvent::ToolCallStart { id, name, input, .. } => {
+                tool_calls.push(json!({
+                    "id": id,
+                    "name": name,
+                    "input": serde_json::to_string(input).unwrap_or_default(),
+                    "status": "running",
+                    "order": tool_calls.len(),
+                }));
+            }
+            AgentEvent::ToolCallEnd { id, result, .. } => {
+                for tc in &mut tool_calls {
+                    if tc["id"].as_str() == Some(id) {
+                        tc["output"] = json!(result.output);
+                        tc["status"] = json!(if result.success { "done" } else { "error" });
+                    }
+                }
+            }
+            AgentEvent::Done { total_turns, total_usage, duration, .. } => {
+                result_meta = Some((
+                    *total_turns,
+                    total_usage.input_tokens,
+                    total_usage.output_tokens,
+                    duration.as_millis() as u64,
+                ));
+            }
+            _ => {}
+        }
+
         let is_done = matches!(envelope.event, AgentEvent::Done { .. });
         let _ = event_tx.send(envelope);
         if is_done {
@@ -106,5 +156,15 @@ pub async fn run_agent(
         }
     }
 
-    Ok(())
+    let (total_turns, input_tokens, output_tokens, duration_ms) =
+        result_meta.unwrap_or((0, 0, 0, 0));
+
+    Ok(RunResult {
+        accumulated_text,
+        tool_calls,
+        total_turns,
+        input_tokens,
+        output_tokens,
+        duration_ms,
+    })
 }

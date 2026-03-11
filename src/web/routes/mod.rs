@@ -3,3 +3,8 @@ pub mod sessions;
 pub mod tasks;
 pub mod notifications;
 pub mod soul;
+pub mod history;
+pub mod groups;
+pub mod auth;
+pub mod search;
+pub mod files;

@@ -42,8 +42,8 @@ A personal AI companion backend built in Rust, powered by [agent-sdk](https://gi
 - **Persistent Soul** — Identity, personality, and memories live in `.md` files that the agent reads and updates
 - **Two-layer Memory** — Core memories (MEMORY.md, never decay) + daily logs (YYYY-MM-DD.md, fade over time)
 - **21 Custom Tools** — Soul management, memory, heartbeat, task scheduling, notifications, code execution, web fetch
-- **Real-time Streaming** — SSE endpoint streams token-by-token responses and tool call events
-- **Task Scheduler** — Cron, interval, once, and delay schedules with poll-based execution
+- **Real-time Streaming** — POST /api/chat returns SSE directly; events stream token-by-token with tool call progress
+- **Task Scheduler** — Cron, interval, once, and delay schedules with poll-based execution and real-time SSE events
 - **Multi-group Support** — Each group has its own soul files; new groups auto-copy from `groups/default/`
 - **Multi-provider Ready** — Architecture supports Anthropic, OpenAI, and Google (Anthropic implemented)
 - **SQLite Storage** — Sessions, messages, tasks, notifications all persisted
@@ -75,15 +75,17 @@ The server starts on port 3100 (configurable via `WEB_PORT`). On first run, `gro
 ### Chat
 
 ```bash
-# Send a message
-curl -X POST http://localhost:3100/api/chat \
+# Send a message (returns SSE stream directly)
+curl -N -X POST http://localhost:3100/api/chat \
   -H "Content-Type: application/json" \
   -d '{"message": "Hello!"}'
 
-# Response: {"run_id": "...", "session_id": "..."}
-
-# Stream events (SSE)
-curl -N http://localhost:3100/api/chat/stream/{run_id}
+# Response: SSE event stream
+# data: {"type":"web_session_id","web_session_id":"abc-123"}
+# data: {"type":"text_delta","text":"Hello"}
+# data: {"type":"text_delta","text":"! How"}
+# data: {"type":"text_delta","text":" can I help?"}
+# data: {"type":"done","result":null,"cost_usd":0.001,"duration_ms":2500,"num_turns":1,"input_tokens":1000,"output_tokens":50,"cache_read_tokens":0,"cache_creation_tokens":0}
 ```
 
 ## Project Structure
@@ -126,7 +128,7 @@ claw-agent-rs/
 │   │   ├── schema.rs         # SQLite tables & indexes
 │   │   ├── stores.rs         # agent-sdk MessageStore/StateStore
 │   │   ├── sessions.rs       # Web sessions CRUD
-│   │   ├── messages.rs       # Chat messages CRUD
+│   │   ├── messages.rs       # Chat messages CRUD (with pagination)
 │   │   ├── tasks.rs          # Scheduled tasks CRUD
 │   │   └── notifications.rs  # Notifications CRUD
 │   ├── scheduler/
@@ -141,14 +143,28 @@ claw-agent-rs/
 │   └── web/
 │       ├── server.rs         # Axum router & startup
 │       ├── state.rs          # AppState
+│       ├── sse.rs            # SSE event transformer (agent events → frontend format)
+│       ├── middleware.rs     # Auth middleware (token validation, cookie/header extraction)
 │       └── routes/
-│           ├── chat.rs       # POST /api/chat, GET /api/chat/stream/:id, ...
-│           ├── sessions.rs   # GET/DELETE /api/sessions
-│           ├── tasks.rs      # GET /api/tasks, POST pause/resume/cancel
-│           ├── notifications.rs # GET/POST/DELETE /api/notifications
-│           └── soul.rs       # GET/PUT /api/soul/:filename
+│           ├── chat.rs       # POST /api/chat (SSE), GET status/stream, POST respond/stop
+│           ├── sessions.rs   # GET/PATCH/DELETE /api/sessions
+│           ├── history.rs    # GET/DELETE /api/history (paginated)
+│           ├── tasks.rs      # CRUD + pause/resume/cancel + logs + SSE events
+│           ├── notifications.rs # GET/PATCH/DELETE /api/notifications
+│           ├── soul.rs       # GET/PUT/DELETE /api/soul, memory search, daily logs
+│           ├── groups.rs     # GET/POST/DELETE /api/groups
+│           ├── auth.rs       # Auth endpoints (status, login, logout, verify)
+│           ├── search.rs     # GET /api/search
+│           └── files.rs      # GET /api/file, POST /api/upload
 ├── tests/
-│   └── tools_integration.rs  # 22 Rust unit tests (all tools)
+│   ├── tools_integration.rs  # 22 tool tests
+│   ├── db_tests.rs           # 25 database tests
+│   ├── auth_tests.rs         # 25 auth tests
+│   ├── soul_manager.rs       # 16 soul manager tests
+│   ├── memory_manager.rs     # 14 memory manager tests
+│   ├── web_api.rs            # 10 web API tests
+│   ├── prompt_tests.rs       # 7 prompt builder tests
+│   └── config_tests.rs       # 3 config tests
 └── data/                     # Runtime (git-ignored)
     └── claw.db               # SQLite database
 ```
@@ -159,45 +175,164 @@ claw-agent-rs/
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/api/chat` | Send message → returns `{run_id, session_id}` |
-| `GET` | `/api/chat/stream/{run_id}` | SSE event stream (tool calls, text deltas, done) |
+| `POST` | `/api/chat` | Send message → returns **SSE stream** directly (not JSON) |
+| `GET` | `/api/chat/status` | Check active runs → `{running, runs: [{runId, sessionId}]}` |
+| `GET` | `/api/chat/stream/{run_id}` | Reconnect to an existing SSE stream |
 | `POST` | `/api/chat/respond` | Answer an `ask_user` question |
-| `POST` | `/api/chat/stop/{run_id}` | Abort a running agent |
+| `POST` | `/api/chat/stop` | Abort a running agent (JSON body: `{runId?}` or `{sessionId?}`) |
+
+**POST /api/chat** accepts:
+```jsonc
+{
+  "message": "Hello!",
+  "newSession": false,         // Force new session
+  "webSessionId": "...",       // Reuse existing session
+  "idempotencyKey": "...",     // Dedup key
+  "images": ["base64..."],     // Attached images
+  "planMode": false,           // Present plan before executing
+  "model": "claude-sonnet-4-6",// Override model
+  "group": "main",             // Target group
+  "mode": "..."                // Custom mode
+}
+```
+
+The first SSE event is always `{"type": "web_session_id", "web_session_id": "..."}`.
 
 ### Sessions
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/sessions` | List all sessions |
-| `GET` | `/api/sessions/{id}` | Get session by ID |
-| `DELETE` | `/api/sessions/{id}` | Delete session |
+| `GET` | `/api/sessions` | List all sessions → `{sessions: [...]}` |
+| `GET` | `/api/sessions/{id}` | Get session with messages |
+| `PATCH` | `/api/sessions/{id}` | Rename session (body: `{title}`) |
+| `DELETE` | `/api/sessions/{id}` | Delete session and its messages |
+| `DELETE` | `/api/sessions` | Delete all sessions and messages |
+
+### History
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/history` | Paginated message history → `{messages, hasMore, total}` |
+| `DELETE` | `/api/history` | Delete all message history |
+
+**GET /api/history** query parameters:
+
+| Param | Description |
+|-------|-------------|
+| `limit` | Max messages to return (default: 100) |
+| `session` | Filter by session ID |
+| `before` | Cursor for pagination (message ID) |
+| `date` | Alias for session |
+| `paginate` | Pagination mode |
 
 ### Tasks
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/tasks` | List scheduled tasks |
+| `GET` | `/api/tasks` | List tasks → `{tasks: [...]}` |
+| `POST` | `/api/tasks` | Create a scheduled task → `{task: {...}}` |
+| `GET` | `/api/tasks/{id}` | Get task by ID → `{task: {...}}` |
+| `PATCH` | `/api/tasks/{id}` | Update task status (body: `{status}`) |
+| `DELETE` | `/api/tasks/{id}` | Delete a task |
 | `POST` | `/api/tasks/{id}/pause` | Pause task |
 | `POST` | `/api/tasks/{id}/resume` | Resume task |
 | `POST` | `/api/tasks/{id}/cancel` | Cancel & delete task |
-| `GET` | `/api/tasks/{id}/logs` | Get task run logs |
+| `GET` | `/api/tasks/{id}/logs` | Get logs for a specific task → `{logs: [...]}` |
+| `GET` | `/api/tasks/logs` | Get all task run logs → `{logs: [...]}` |
+| `GET` | `/api/tasks/events` | SSE stream for real-time task lifecycle events |
+
+**POST /api/tasks** body:
+```jsonc
+{
+  "prompt": "Check the weather",
+  "schedule_type": "cron",       // cron | interval | once | delay
+  "schedule_value": "0 9 * * *", // cron expr | ms | ISO datetime | ms delay
+  "group_folder": "main",        // Optional, defaults to MAIN_GROUP
+  "context_mode": "group",       // group | isolated
+  "web_session_id": "..."        // Optional, for session context
+}
+```
 
 ### Notifications
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/notifications` | List notifications |
-| `POST` | `/api/notifications/{id}/read` | Mark as read |
+| `GET` | `/api/notifications` | List notifications → `{notifications: [...], unreadCount}` |
+| `PATCH` | `/api/notifications/{id}/read` | Mark notification as read |
 | `POST` | `/api/notifications/read-all` | Mark all as read |
 | `DELETE` | `/api/notifications/{id}` | Delete notification |
+
+**GET /api/notifications** query parameters: `unread` (bool), `limit` (number).
 
 ### Soul Files
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/soul/{filename}` | Read a soul file |
-| `PUT` | `/api/soul/{filename}` | Write a soul file |
-| `GET` | `/api/soul/memory/search?q=...` | Search memory |
+| `GET` | `/api/soul` | List all soul files → `{files: [...]}` |
+| `GET` | `/api/soul/{filename}` | Read a soul file (supports nested paths) |
+| `PUT` | `/api/soul/{filename}` | Write a soul file (body: `{"content": "..."}`) |
+| `DELETE` | `/api/soul/{filename}` | Delete a soul file (BOOTSTRAP.md only) |
+| `GET` | `/api/soul/memory/search?q=...&days=7` | Search memory |
+| `GET` | `/api/soul/memory/daily` | List daily log files → `{logs: [...]}` |
+
+### Groups
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/groups` | List all groups → `{groups: [...]}` |
+| `POST` | `/api/groups` | Create group from default template |
+| `DELETE` | `/api/groups/{folder}` | Delete a group (cannot delete default or main) |
+
+**POST /api/groups** body:
+```jsonc
+{
+  "name": "work",
+  "folder": "work",
+  "trigger": "direct"  // optional
+}
+```
+
+### Auth
+
+All auth endpoints are **public** (no token required). When `AUTH_ENABLED=1`, all other routes except `/api/health` require authentication via cookie (`claw-token`) or header (`Authorization: Bearer <token>`).
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/api/auth/status` | Public | Check if auth is enabled → `{auth_enabled: bool}` |
+| `POST` | `/api/auth/login` | Public | Login with password → `{ok: true, token: "..."}` |
+| `POST` | `/api/auth/logout` | Public | Logout (clears cookie) → `{ok: true}` |
+| `GET` | `/api/auth/verify?token=...` | Public | Verify token validity → `{ok: true}` |
+
+**POST /api/auth/login** body:
+```jsonc
+{
+  "password": "your-password"
+}
+```
+
+**Auth behavior by mode:**
+
+| `AUTH_ENABLED` | Login | Protected routes |
+|----------------|-------|-----------------|
+| `0` (default) | Returns `{ok: true, token: "none"}` | All routes accessible without authentication |
+| `1` | Validates password against `AUTH_PASSWORD`, returns HMAC-SHA256 signed token (valid 7 days) | Requires `claw-token` cookie or `Authorization: Bearer` header |
+
+**Token format:** JWT-like with HMAC-SHA256 signature, derived from `AUTH_SECRET` (auto-derived from `AUTH_PASSWORD` if not explicitly set).
+
+### Search
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/search?q=...` | Full-text search across messages → `{results: [...]}` |
+
+Results are grouped by session with preview snippets and match counts.
+
+### Files
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/file?path=...` | Serve a file with correct content-type |
+| `POST` | `/api/upload` | Upload files via multipart → `{files: [...]}` |
 
 ### Health
 
@@ -207,29 +342,51 @@ claw-agent-rs/
 
 ## SSE Event Types
 
-Events streamed from `/api/chat/stream/{run_id}`:
+Events streamed from `POST /api/chat` (and reconnectable via `GET /api/chat/stream/{run_id}`):
 
 ```jsonc
-// Agent starts processing a turn
-{"type": "start", "thread_id": "...", "turn": 1}
-
-// Tool call begins
-{"type": "tool_call_start", "name": "soul_read", "input": {...}, "tier": "Observe"}
-
-// Tool call completes
-{"type": "tool_call_end", "name": "soul_read", "result": {"success": true, "output": "..."}}
+// Session identifier (always first event)
+{"type": "web_session_id", "web_session_id": "abc-123"}
 
 // Text token streamed
-{"type": "text_delta", "delta": "Hello"}
+{"type": "text_delta", "text": "Hello"}
 
-// Full text message
-{"type": "text", "text": "Hello! How can I help?"}
+// Thinking/reasoning token
+{"type": "thinking", "text": "Let me consider..."}
 
-// Turn completes
-{"type": "turn_complete", "turn": 1, "usage": {"input_tokens": 1000, "output_tokens": 50}}
+// Tool call begins
+{"type": "tool_use_start", "id": "tool_1", "name": "soul_read", "input": "{...}"}
 
-// Agent finished
-{"type": "done", "total_turns": 2, "total_usage": {...}, "duration": {"secs": 5}}
+// Tool call completes
+{"type": "tool_result", "id": "tool_1", "output": "...", "is_error": false}
+
+// Sub-agent tool call begins (nested tool within run_background)
+{"type": "sub_tool_use_start", "id": "sub_1", "name": "web_fetch", "input": "", "parent_tool_use_id": "agent_1"}
+
+// Sub-agent tool call completes
+{"type": "sub_tool_result", "id": "sub_1", "output": "...", "is_error": false, "parent_tool_use_id": "agent_1"}
+
+// Tool progress heartbeat
+{"type": "tool_progress", "tool_use_id": "tool_1", "tool_name": "code_execute", "parent_tool_use_id": null, "elapsed_seconds": 0}
+
+// Agent finished — includes cost and usage stats
+{"type": "done", "result": null, "cost_usd": 0.001, "duration_ms": 2500, "num_turns": 1, "input_tokens": 1000, "output_tokens": 50, "cache_read_tokens": 0, "cache_creation_tokens": 0}
+
+// Error occurred
+{"type": "error", "error": "rate limit exceeded"}
+```
+
+### Task Events (SSE)
+
+Events streamed from `GET /api/tasks/events`:
+
+```jsonc
+{"type": "task_created", "task_id": "...", "timestamp": "..."}
+{"type": "task_updated", "task_id": "...", "timestamp": "..."}
+{"type": "task_paused", "task_id": "...", "timestamp": "..."}
+{"type": "task_resumed", "task_id": "...", "timestamp": "..."}
+{"type": "task_cancelled", "task_id": "...", "timestamp": "..."}
+{"type": "task_deleted", "task_id": "...", "timestamp": "..."}
 ```
 
 ## Custom Tools (21)
@@ -276,13 +433,27 @@ All settings via environment variables (`.env` file supported):
 | `SCHEDULER_POLL_INTERVAL` | `15` | Scheduler poll interval (seconds) |
 | `MAX_CONCURRENT_TASKS` | `3` | Max parallel scheduled tasks |
 | `AGENT_TIMEOUT` | `300` | Agent execution timeout (seconds) |
+| `AUTH_ENABLED` | `0` | Enable authentication (`0` = off, `1` = on) |
+| `AUTH_PASSWORD` | — | Password for login (required when auth enabled) |
+| `AUTH_SECRET` | — | HMAC-SHA256 secret for token signing (auto-derived from password if not set) |
 | `RUST_LOG` | — | Log filter (e.g. `claw_agent_rs=debug`) |
 
 ## Testing
 
 ```bash
-# Rust unit tests (all 21 tools + error cases) — 22 tests
+# Run all tests — 8 test files, 238 tests
 cargo test
+
+# Test files:
+#   tools_integration.rs  — 22 tool unit tests
+#   db_tests.rs           — 25 database CRUD tests
+#   auth_tests.rs         — 25 authentication tests (login, token, middleware, cookie/header)
+#   soul_manager.rs       — 16 soul file I/O tests
+#   memory_manager.rs     — 14 memory manager tests
+#   web_api.rs            — 10 web API endpoint tests
+#   prompt_tests.rs       — 7 system prompt builder tests
+#   config_tests.rs       — 3 configuration tests
+#   + 4 inline tests in src/soul/markdown.rs
 ```
 
 ## Multi-Group Support
@@ -299,7 +470,21 @@ groups/
 └── personal/         # MAIN_GROUP=personal → auto-created from default
 ```
 
-To create a new agent, set `MAIN_GROUP=<name>` and restart. The group is auto-provisioned from `groups/default/`.
+To create a new agent, set `MAIN_GROUP=<name>` and restart. The group is auto-provisioned from `groups/default/`. Groups can also be managed via the `/api/groups` endpoints.
+
+## Response Wrapping
+
+All list endpoints return wrapped responses for consistent frontend consumption:
+
+| Endpoint | Response shape |
+|----------|---------------|
+| `GET /api/sessions` | `{sessions: [...]}` |
+| `GET /api/tasks` | `{tasks: [...]}` |
+| `GET /api/notifications` | `{notifications: [...], unreadCount: N}` |
+| `GET /api/history` | `{messages: [...], hasMore: bool, total: N}` |
+| `GET /api/groups` | `{groups: [...]}` |
+| `GET /api/soul` | `{files: [...]}` |
+| `GET /api/search` | `{results: [...]}` |
 
 ## Dependencies
 
@@ -313,6 +498,8 @@ To create a new agent, set `MAIN_GROUP=<name>` and restart. The group is auto-pr
 | chrono + cron | Time handling + cron parsing |
 | dashmap | Concurrent HashMap |
 | tracing | Structured logging |
+| uuid | ID generation |
+| futures + tokio-stream | Stream combinators for SSE |
 
 ## License
 

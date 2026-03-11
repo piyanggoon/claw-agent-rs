@@ -33,6 +33,10 @@ async fn main() -> anyhow::Result<()> {
     // Ensure data directory exists
     std::fs::create_dir_all(&config.data_dir)?;
 
+    // Ensure uploads directory exists
+    let uploads_dir = config.data_dir.join("uploads");
+    std::fs::create_dir_all(&uploads_dir)?;
+
     // Initialize SQLite database
     let db_path = config.data_dir.join("claw.db");
     let conn = rusqlite::Connection::open(&db_path)?;
@@ -83,6 +87,7 @@ async fn main() -> anyhow::Result<()> {
     // Create broadcast channels
     let (notification_tx, _) = broadcast::channel::<NotificationEvent>(256);
     let (chat_tx, _) = broadcast::channel::<ChatMessageEvent>(256);
+    let (task_events_tx, _) = broadcast::channel::<serde_json::Value>(256);
 
     // Create scheduler handle
     let scheduler_handle = Arc::new(SchedulerHandle::new());
@@ -99,6 +104,9 @@ async fn main() -> anyhow::Result<()> {
         notification_tx: notification_tx.clone(),
         chat_tx: chat_tx.clone(),
         pending_questions: Arc::new(dashmap::DashMap::new()),
+        run_sessions: Arc::new(dashmap::DashMap::new()),
+        custom_events: Arc::new(dashmap::DashMap::new()),
+        task_events_tx: task_events_tx.clone(),
     };
 
     // Start task scheduler

@@ -120,6 +120,7 @@ impl TaskScheduler {
             pending_questions,
             session_id: None,
             config: self.config.clone(),
+            custom_event_tx: None,
         };
 
         // Determine thread_id based on context mode
@@ -140,7 +141,19 @@ impl TaskScheduler {
 
         // Update task after run
         let (status, result_text, error_text) = match &result {
-            Ok(()) => ("success", Some("Task completed successfully".to_string()), None),
+            Ok(run_result) => {
+                let summary = if run_result.accumulated_text.is_empty() {
+                    "Task completed successfully".to_string()
+                } else {
+                    let text = &run_result.accumulated_text;
+                    if text.len() > 500 {
+                        format!("{}...", &text[..500])
+                    } else {
+                        text.clone()
+                    }
+                };
+                ("success", Some(summary), None)
+            }
             Err(e) => ("error", None, Some(e.to_string())),
         };
 

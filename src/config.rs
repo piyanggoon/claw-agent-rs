@@ -19,6 +19,15 @@ pub struct ClawConfig {
     pub web_port: u16,
     pub timezone: String,
 
+    // Authentication
+    /// Whether authentication is required for the web UI.
+    pub auth_enabled: bool,
+    /// The password users must enter to access the web UI.
+    pub auth_password: Option<String>,
+    /// Secret key for HMAC-SHA256 token signing.
+    /// If not set explicitly, derived from `auth_password` as `claw-auth-{password}-secret-key`.
+    pub auth_secret: String,
+
     // Scheduler
     pub scheduler_poll_interval: Duration,
     pub max_concurrent_tasks: usize,
@@ -39,10 +48,25 @@ impl ClawConfig {
     /// | `DEFAULT_MODEL`           | `"claude-sonnet-4-6"` |
     /// | `WEB_PORT`                | `3100`             |
     /// | `TIMEZONE`                | `"Asia/Bangkok"`   |
+    /// | `AUTH_ENABLED`            | `"0"`              |
+    /// | `AUTH_PASSWORD`           | —                  |
+    /// | `AUTH_SECRET`             | derived from password |
     /// | `SCHEDULER_POLL_INTERVAL` | `15` (seconds)     |
     /// | `MAX_CONCURRENT_TASKS`    | `3`                |
     /// | `AGENT_TIMEOUT`           | `300` (seconds)    |
     pub fn from_env() -> Self {
+        let auth_password = env::var("AUTH_PASSWORD").ok();
+        let auth_secret = env::var("AUTH_SECRET").unwrap_or_else(|_| {
+            // Derive from password, matching SoulClaw frontend convention
+            match &auth_password {
+                Some(pw) => format!("claw-auth-{pw}-secret-key"),
+                None => String::new(),
+            }
+        });
+        let auth_enabled = env::var("AUTH_ENABLED")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
         Self {
             data_dir: PathBuf::from(
                 env::var("DATA_DIR").unwrap_or_else(|_| "./data".into()),
@@ -69,6 +93,10 @@ impl ClawConfig {
 
             timezone: env::var("TIMEZONE")
                 .unwrap_or_else(|_| "Asia/Bangkok".into()),
+
+            auth_enabled,
+            auth_password,
+            auth_secret,
 
             scheduler_poll_interval: Duration::from_secs(
                 env::var("SCHEDULER_POLL_INTERVAL")

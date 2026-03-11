@@ -22,10 +22,11 @@ a personal AI companion backend built in Rust.
 13. [Multi-Group Architecture](#multi-group-architecture)
 14. [LLM Provider System](#llm-provider-system)
 15. [Hooks System](#hooks-system)
-16. [Configuration Reference](#configuration-reference)
-17. [Testing](#testing)
-18. [Key Design Decisions](#key-design-decisions)
-19. [Dependency Map](#dependency-map)
+16. [Authentication](#authentication)
+17. [Configuration Reference](#configuration-reference)
+18. [Testing](#testing)
+19. [Key Design Decisions](#key-design-decisions)
+20. [Dependency Map](#dependency-map)
 
 ---
 
@@ -89,6 +90,7 @@ main.rs
  ├── config.rs          ClawConfig (env vars → struct)
  ├── context.rs         ClawContext (shared state for tools)
  ├── hooks.rs           ClawHooks (AgentHooks trait impl)
+ ├── error.rs           Custom error types
  ├── db/
  │   ├── schema.rs      SQLite CREATE TABLE statements
  │   ├── stores.rs      agent-sdk MessageStore/StateStore trait impls
@@ -104,7 +106,7 @@ main.rs
  │   └── manager.rs     MemoryManager — save/recall/forget/daily_log
  ├── agent/
  │   ├── provider.rs    LLM provider factory (Anthropic)
- │   └── runner.rs      Agent execution orchestration
+ │   └── runner.rs      Agent execution orchestration + RunResult
  ├── scheduler/
  │   └── engine.rs      Poll-based task scheduler
  ├── tools/
@@ -115,14 +117,22 @@ main.rs
  │   ├── tasks.rs       5 task tools
  │   └── utility.rs     6 utility tools
  └── web/
-     ├── server.rs      Router + axum::serve
+     ├── server.rs      Router + axum::serve (public/protected route split)
      ├── state.rs       AppState struct
+     ├── sse.rs         AgentEvent → frontend JSON transformer
+     ├── middleware.rs   Auth middleware (cookie/bearer token validation)
      └── routes/
-         ├── chat.rs       Chat endpoints
-         ├── sessions.rs   Session endpoints
-         ├── tasks.rs      Task endpoints
+         ├── mod.rs         Route module exports
+         ├── chat.rs        Chat endpoints (SSE-first)
+         ├── sessions.rs    Session endpoints (CRUD + rename)
+         ├── history.rs     Message history endpoints
+         ├── tasks.rs       Task CRUD + logs + SSE events
          ├── notifications.rs  Notification endpoints
-         └── soul.rs       Soul file endpoints
+         ├── soul.rs        Soul file endpoints (list, read, write, delete, daily logs)
+         ├── groups.rs      Group management endpoints
+         ├── auth.rs        Auth endpoints (token generation/verification)
+         ├── search.rs      Message search endpoint
+         └── files.rs       File serve + upload endpoints
 ```
 
 ---
@@ -151,8 +161,15 @@ pub struct ClawConfig {
     pub scheduler_poll_interval: Duration,
     pub max_concurrent_tasks: usize,
     pub agent_timeout: Duration,
+    pub auth_enabled: bool,             // Enable/disable auth (AUTH_ENABLED env)
+    pub auth_password: Option<String>,  // Password for login (AUTH_PASSWORD env)
+    pub auth_secret: String,            // HMAC-SHA256 signing key (AUTH_SECRET or auto-derived)
 }
 ```
+
+**Auth secret derivation:** If `AUTH_SECRET` is not set, it is auto-derived from the password
+as `claw-auth-{password}-secret-key`. If auth is enabled but no password is set, the server
+should warn at startup.
 
 Helper method: `config.soul_dir()` → `{groups_dir}/{main_group}/soul`
 
@@ -172,6 +189,10 @@ pub struct ClawContext {
     pub pending_questions: Arc<DashMap<String, oneshot::Sender<String>>>,
     pub session_id: Option<String>,
     pub config: Arc<ClawConfig>,
+    /// Optional broadcast sender for injecting custom SSE events
+    /// (e.g., ask_user questions) directly into the frontend's SSE stream.
+    /// Set when running via web chat, `None` for background/scheduled tasks.
+    pub custom_event_tx: Option<broadcast::Sender<serde_json::Value>>,
 }
 ```
 
@@ -184,10 +205,29 @@ pub struct ChatMessageEvent { session_id, content }
 
 ### `AppState` (`src/web/state.rs`)
 
-The web server state, similar to `ClawContext` but includes web-specific fields:
+The web server state, shared across all Axum route handlers. Every field is cheaply
+cloneable (`Arc` or broadcast handles).
 
-- `active_runs: Arc<DashMap<String, broadcast::Sender<AgentEventEnvelope>>>`
-- `abort_handles: Arc<DashMap<String, AbortHandle>>`
+```rust
+pub struct AppState {
+    pub db: Arc<Mutex<rusqlite::Connection>>,
+    pub soul: Arc<SoulManager>,
+    pub memory: Arc<MemoryManager>,
+    pub config: Arc<ClawConfig>,
+    pub scheduler: Arc<SchedulerHandle>,
+    pub active_runs: Arc<DashMap<String, broadcast::Sender<AgentEventEnvelope>>>,
+    pub abort_handles: Arc<DashMap<String, AbortHandle>>,
+    pub notification_tx: broadcast::Sender<NotificationEvent>,
+    pub chat_tx: broadcast::Sender<ChatMessageEvent>,
+    pub pending_questions: Arc<DashMap<String, oneshot::Sender<String>>>,
+    /// Maps run_id → session_id for chat status reporting.
+    pub run_sessions: Arc<DashMap<String, String>>,
+    /// Custom SSE event channels per run (for ask_user, plan_update, etc.).
+    pub custom_events: Arc<DashMap<String, broadcast::Sender<serde_json::Value>>>,
+    /// Broadcast channel for real-time task lifecycle events (SSE to frontend).
+    pub task_events_tx: broadcast::Sender<serde_json::Value>,
+}
+```
 
 ---
 
@@ -199,20 +239,31 @@ A complete chat request flows through these steps:
 
 ```
 POST /api/chat
-{ "message": "Hello!", "session_id": "optional-uuid", "model": "optional" }
+{
+  "message": "Hello!",
+  "webSessionId": "optional-uuid",
+  "newSession": false,
+  "model": "optional",
+  "images": ["optional-base64"],
+  "planMode": false,
+  "group": "optional"
+}
 ```
 
 ### 2. Route Handler (`web/routes/chat.rs::create_chat`)
 
 1. Generate `run_id` (UUID)
-2. Resolve or create `session_id`
+2. Determine `session_id` — create new if `newSession=true` or no `webSessionId` provided
 3. Ensure web session exists in SQLite
-4. Store user message in `messages` table
-5. Create a `broadcast::channel(256)` for this run
-6. Insert `(run_id, tx)` into `active_runs` DashMap
-7. **Spawn tokio task** for agent execution
-8. Store `abort_handle` for cancellation
-9. Return `201 Created` with `{ run_id, session_id }` immediately
+4. Build message text with image references and plan mode prefix
+5. Store user message in `messages` table
+6. Create two broadcast channels: `event_tx` (agent events, capacity 256) and `custom_tx` (custom events, capacity 64)
+7. **Subscribe to both channels BEFORE spawning** (to avoid missing events)
+8. Insert into `active_runs`, `custom_events`, and `run_sessions` DashMaps
+9. **Spawn tokio task** for agent execution
+10. Store `abort_handle` for cancellation
+11. Build merged SSE stream: prepend `web_session_id` event, then merge agent + custom streams
+12. **Return SSE stream directly** as the response body (not JSON — the response IS the stream)
 
 ### 3. Agent Execution (`agent/runner.rs::run_agent`)
 
@@ -226,35 +277,54 @@ Inside the spawned tokio task:
 6. **Build AgentConfig** — `{ system_prompt, model, max_turns: 100, streaming: true }`
 7. **Build AgentLoop** — via `builder::<ClawContext>().provider().tools().hooks().stores().build_with_stores()`
 8. **Run the agent** — `agent.run(thread_id, AgentInput::Text(message), tool_ctx)`
-9. **Forward events** — reads from `events.recv()` and sends to `event_tx`
+9. **Forward events** — reads from `events.recv()`, accumulates text/metadata, sends to `event_tx`
 10. **Wait for completion** — processes `AgentRunState::Done` or `::Error`
-11. **Cleanup** — removes from `active_runs` and `abort_handles`
+11. **Return RunResult** — accumulated text, tool calls, token usage, duration
 
-### 4. SSE Streaming (`web/routes/chat.rs::stream_events`)
+After run_agent returns, the spawned task:
+- Stores the assistant message with metadata (tool calls, cost, tokens) in the DB
+- Cleans up: removes from `active_runs`, `custom_events`, `abort_handles`, `run_sessions`
 
+### 4. SSE Streaming (inline in `POST /api/chat` response)
+
+The SSE stream is returned directly from `POST /api/chat`. It consists of:
+
+1. **Initial event**: `{"type": "web_session_id", "web_session_id": "..."}`
+2. **Agent event stream**: `AgentEventEnvelope` objects transformed via `sse.rs` into frontend JSON format
+3. **Custom event stream**: Raw JSON values from `custom_event_tx` (e.g., `ask_user` questions)
+4. The two streams are merged with `tokio_stream::StreamExt::merge()`
+5. A keep-alive ping is sent every 15 seconds
+
+**Reconnection:** `GET /api/chat/stream/{run_id}` allows reconnecting to a running agent's event stream.
+
+### 5. RunResult (`agent/runner.rs`)
+
+The agent runner accumulates data during execution and returns a `RunResult`:
+
+```rust
+pub struct RunResult {
+    pub accumulated_text: String,       // All text deltas concatenated
+    pub tool_calls: Vec<serde_json::Value>, // Tool call records with id, name, input, output, status
+    pub total_turns: usize,             // Number of agent turns
+    pub input_tokens: u32,              // Total input tokens consumed
+    pub output_tokens: u32,             // Total output tokens consumed
+    pub duration_ms: u64,               // Agent run duration in milliseconds
+}
 ```
-GET /api/chat/stream/{run_id}
-```
 
-1. Look up `run_id` in `active_runs` DashMap
-2. Create a new `BroadcastStream` subscriber
-3. Return Axum `Sse<Stream>` that serializes each `AgentEventEnvelope` as JSON
-4. Stream ends when the broadcast sender is dropped (agent finished)
-
-### 5. Complete Flow Diagram
+### 6. Complete Flow Diagram
 
 ```
 Client                          Server                          LLM
   │                               │                              │
   │── POST /api/chat ────────────►│                              │
-  │◄── 201 {run_id, session_id} ──│                              │
+  │◄── SSE: web_session_id ───────│                              │
   │                               │── build system prompt ──────►│
-  │── GET /stream/{run_id} ──────►│                              │
   │                               │◄── streaming response ───────│
   │◄── SSE: text_delta ───────────│                              │
-  │◄── SSE: tool_call_start ──────│                              │
+  │◄── SSE: tool_use_start ───────│                              │
   │                               │── execute tool locally ──────│
-  │◄── SSE: tool_call_end ────────│                              │
+  │◄── SSE: tool_result ──────────│                              │
   │                               │── tool result → LLM ────────►│
   │◄── SSE: text_delta ───────────│◄── continue response ────────│
   │◄── SSE: done ─────────────────│                              │
@@ -407,7 +477,7 @@ Currently, `ClawHooks::pre_tool_use()` returns `ToolDecision::Allow` for all tie
 |------|-----------|-------------|
 | `send_notification` | `title: string`, `message: string` (required), `level: "info"\|"success"\|"warning"\|"error"` (default: "info") | Persist notification to DB + broadcast via SSE |
 | `send_chat_message` | `content: string` (required), `web_session_id: string` (optional) | Send markdown message to chat UI |
-| `ask_user` | `question: string` (required), `options: string[]` (optional) | Ask question + block up to 5 minutes for response. Uses oneshot channel via `pending_questions` DashMap |
+| `ask_user` | `question: string` (required), `options: string[]` (optional) | Ask question + block up to 5 minutes for response. Sends via `custom_event_tx` directly into SSE stream (falls back to `chat_tx` if unavailable). Uses oneshot channel via `pending_questions` DashMap |
 | `run_background` | `prompt: string` (required) | Create immediate task (delay=0, isolated) via scheduler |
 | `web_fetch` | `url: string` (required), `selector: string` (optional, reserved), `max_length: number` (default: 50000) | HTTP GET with 30s timeout. HTML → plain text via html2text. Truncates at max_length |
 | `code_execute` | `language: "javascript"\|"python"\|"bash"` (required), `code: string` (required), `timeout: number` (default: 10000, max: 30000) | Subprocess execution. Returns stdout + stderr. Tier: Confirm |
@@ -688,95 +758,182 @@ for the next poll interval.
 
 ### Router (`src/web/server.rs`)
 
-Built with Axum. Middleware: CORS (permissive) + tracing.
+Built with Axum. Middleware: CORS (permissive) + tracing + auth middleware.
 
-### Chat Endpoints
+Routes are split into two groups:
+- **Public routes** — `/api/health` and `/api/auth/*` — no authentication required
+- **Protected routes** — all other `/api/*` routes — require valid token when `auth_enabled = true`
 
-#### `POST /api/chat`
-```json
-// Request
-{ "message": "Hello!", "session_id": "uuid (optional)", "model": "string (optional)" }
-// Response (201)
-{ "run_id": "uuid", "session_id": "uuid" }
-```
+The auth middleware (`src/web/middleware.rs`) is applied as an Axum layer on the protected
+router. When auth is disabled (`AUTH_ENABLED=0`), all routes pass through without token checks.
 
-Spawns agent in background task. Returns immediately for SSE subscription.
+### Chat Endpoints (Protected)
 
-#### `GET /api/chat/stream/{run_id}`
-SSE stream. Returns `AgentEventEnvelope` JSON objects. Stream ends when agent finishes.
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/api/chat` | Send message, returns SSE stream directly. First event: `{type: "web_session_id", ...}`. Body: `{message, webSessionId?, newSession?, model?, images?, planMode?, group?, mode?}` |
+| `GET` | `/api/chat/status` | Returns `{running: bool, runs: [{runId, sessionId}]}` |
+| `GET` | `/api/chat/stream/{run_id}` | SSE reconnection to a running agent's event stream |
+| `POST` | `/api/chat/respond` | Resolve a pending `ask_user` question. Body: `{question_id, response, run_id?}` |
+| `POST` | `/api/chat/stop` | Stop a running agent. Body: `{runId?, sessionId?}`. Resolves run by runId, sessionId, or picks the first active run |
 
-#### `POST /api/chat/respond`
-```json
-{ "question_id": "uuid", "answer": "user's response" }
-```
-Resolves a pending `ask_user` question. Sends answer through oneshot channel.
+### Session Endpoints (Protected)
 
-#### `POST /api/chat/stop/{run_id}`
-Aborts the running agent by calling `abort_handle.abort()`.
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/sessions` | List all sessions (ordered by last_message_at desc) with message counts |
+| `GET` | `/api/sessions/{id}` | Get session detail + all messages |
+| `PATCH` | `/api/sessions/{id}` | Rename session. Body: `{title: string}` |
+| `DELETE` | `/api/sessions/{id}` | Delete session and its messages |
+| `DELETE` | `/api/sessions` | Delete ALL sessions and messages |
 
-### Session Endpoints
+### History Endpoints (Protected)
 
-| Endpoint | Description |
-|----------|-------------|
-| `GET /api/sessions` | List all sessions (ordered by last_message_at desc) |
-| `GET /api/sessions/{id}` | Get session detail + messages |
-| `DELETE /api/sessions/{id}` | Delete session and its messages |
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/history` | Get paginated messages. Query: `?session=&limit=&before=&date=&paginate=`. Returns `{messages, hasMore, total}` |
+| `DELETE` | `/api/history` | Delete all messages |
 
-### Task Endpoints
+### Task Endpoints (Protected)
 
-| Endpoint | Description |
-|----------|-------------|
-| `GET /api/tasks` | List all scheduled tasks |
-| `POST /api/tasks/{id}/pause` | Set status = "paused" |
-| `POST /api/tasks/{id}/resume` | Set status = "active" |
-| `POST /api/tasks/{id}/cancel` | Delete task from DB |
-| `GET /api/tasks/{id}/logs` | Get run history for a task |
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/tasks` | List all tasks. Query: `?group=` for filtering |
+| `POST` | `/api/tasks` | Create task. Body: `{prompt, schedule_type, schedule_value, group_folder?, context_mode?, web_session_id?}` |
+| `GET` | `/api/tasks/{id}` | Get single task |
+| `PATCH` | `/api/tasks/{id}` | Update task. Body: `{status?}` |
+| `DELETE` | `/api/tasks/{id}` | Delete task |
+| `POST` | `/api/tasks/{id}/pause` | Set status = "paused" |
+| `POST` | `/api/tasks/{id}/resume` | Set status = "active" |
+| `POST` | `/api/tasks/{id}/cancel` | Delete task from DB |
+| `GET` | `/api/tasks/{id}/logs` | Get run history for a task. Query: `?limit=20` |
+| `GET` | `/api/tasks/logs` | Get all task run logs. Query: `?limit=50` |
+| `GET` | `/api/tasks/events` | SSE stream for real-time task lifecycle events (task_created, task_updated, task_paused, task_resumed, task_cancelled, task_deleted) |
 
-### Notification Endpoints
+### Notification Endpoints (Protected)
 
-| Endpoint | Description |
-|----------|-------------|
-| `GET /api/notifications` | List all (ordered by created_at desc) |
-| `POST /api/notifications/{id}/read` | Set read = 1 |
-| `POST /api/notifications/read-all` | Set read = 1 for all |
-| `DELETE /api/notifications/{id}` | Delete notification |
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/notifications` | List notifications. Query: `?unread=bool&limit=N`. Returns `{notifications, unreadCount}` |
+| `PATCH` | `/api/notifications/{id}/read` | Mark single notification as read |
+| `POST` | `/api/notifications/read-all` | Mark all notifications as read |
+| `DELETE` | `/api/notifications/{id}` | Delete notification |
 
-### Soul Endpoints
+### Soul Endpoints (Protected)
 
-| Endpoint | Description |
-|----------|-------------|
-| `GET /api/soul/{*filename}` | Read soul file (e.g. `/api/soul/MEMORY.md`) |
-| `PUT /api/soul/{*filename}` | Write soul file |
-| `GET /api/soul/memory/search?q=query&days=7` | Search memory |
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/soul` | List all soul files with metadata (path, name, size, modified_at). Query: `?group=` |
+| `GET` | `/api/soul/memory/search` | Search memory. Query: `?q=query&days=7` |
+| `GET` | `/api/soul/memory/daily` | List daily log files (filename, date, size, modified_at), sorted by date desc |
+| `GET` | `/api/soul/{*filename}` | Read soul file content. Returns `{filename, content, path}` |
+| `PUT` | `/api/soul/{*filename}` | Write soul file. Body: `{content: string}` (JSON). Returns `{ok, filename, size, modified_at}` |
+| `DELETE` | `/api/soul/{*filename}` | Delete soul file. **Only BOOTSTRAP.md allowed** (403 otherwise) |
 
-### Health
+### Groups Endpoints (Protected)
 
-| Endpoint | Description |
-|----------|-------------|
-| `GET /api/health` | Returns `"ok"` |
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/groups` | List all groups (excludes "default"). Returns `{groups: [{name, folder, trigger}]}` |
+| `POST` | `/api/groups` | Create group from default template. Body: `{name, folder, trigger?}` |
+| `DELETE` | `/api/groups/{folder}` | Delete group. Cannot delete "default" or the main group |
+
+### Auth Endpoints (Public — no auth required)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/auth/status` | Returns `{auth_enabled: bool}`. Indicates whether authentication is active |
+| `POST` | `/api/auth/login` | Body: `{password: string}`. Validates password, returns `{ok: true, token: string}` and sets `claw-token` cookie. Token is HMAC-SHA256 signed, valid for 7 days |
+| `POST` | `/api/auth/logout` | Clears the `claw-token` cookie. Returns `{ok: true}` |
+| `GET` | `/api/auth/verify` | Validates token from `claw-token` cookie or `Authorization: Bearer` header. Returns `{ok: true}` or 401 |
+
+### Search Endpoints (Protected)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/search` | Search messages by content. Query: `?q=`. Returns `{results: [{sessionId, sessionDate, matchCount, preview}]}` |
+
+### File Endpoints (Protected)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/file` | Serve a file. Query: `?path=`. Returns file content with appropriate Content-Type header |
+| `POST` | `/api/upload` | Upload file(s) via multipart. Returns `{files: [{filename, path, url}]}` |
+
+### Health (Public — no auth required)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/health` | Returns `"ok"` |
 
 ---
 
 ## SSE Event Protocol
 
-Events from `/api/chat/stream/{run_id}` are `AgentEventEnvelope` objects serialized as JSON.
+### Event Transformer (`src/web/sse.rs`)
 
-### Event Types
+The `sse.rs` module transforms raw `AgentEventEnvelope` objects from agent-sdk into the
+simplified JSON format expected by the SoulClaw frontend. The function `transform_event()`
+takes an envelope and returns `Option<Value>` — returning `None` for events that should
+be silently skipped.
 
-| Type | Fields | When |
-|------|--------|------|
-| `start` | `thread_id`, `turn` | Agent begins a new turn |
-| `tool_call_start` | `name`, `input`, `tier` | Before tool execution |
-| `tool_call_end` | `name`, `result: {success, output}` | After tool execution |
-| `text_delta` | `delta` | Token-by-token streaming |
-| `text` | `text` | Full text message |
-| `turn_complete` | `turn`, `usage: {input_tokens, output_tokens}` | Turn finished |
-| `done` | `total_turns`, `total_usage`, `duration` | Agent completed |
-| `error` | `message` | Agent error |
+### Event Type Mapping
+
+| agent-sdk Event | Frontend Type | Key Fields | Description |
+|-----------------|---------------|------------|-------------|
+| `TextDelta` | `text_delta` | `text` | Token-by-token streaming text |
+| `ThinkingDelta` | `thinking` | `text` | Extended thinking / chain-of-thought |
+| `ToolCallStart` | `tool_use_start` | `id`, `name`, `input` | Before tool execution begins |
+| `ToolCallEnd` | `tool_result` | `id`, `output`, `is_error` | After tool execution completes |
+| `ToolProgress` | `tool_progress` | `tool_use_id`, `tool_name`, `parent_tool_use_id`, `elapsed_seconds` | Long-running tool progress updates |
+| `SubagentProgress` (not completed) | `sub_tool_use_start` | `id`, `name`, `input`, `parent_tool_use_id` | Sub-agent starts a tool call |
+| `SubagentProgress` (completed) | `sub_tool_result` | `id`, `output`, `is_error`, `parent_tool_use_id` | Sub-agent finishes a tool call |
+| `Done` | `done` | `result`, `cost_usd`, `duration_ms`, `num_turns`, `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens` | Agent completed successfully |
+| `Error` | `error` | `error` | Agent error message |
+| `Start`, `Text`, `Thinking`, `TurnComplete`, `ToolRequiresConfirmation`, `Refusal`, `ContextCompacted` | (skipped) | — | Not relevant to frontend, silently dropped |
+
+### Cost Estimation
+
+`sse.rs` includes `estimate_cost(input_tokens, output_tokens)` which calculates an approximate
+USD cost using Claude Sonnet pricing ($3/M input, $15/M output). The result is rounded to
+6 decimal places.
+
+### Custom Events
+
+In addition to transformed agent events, the SSE stream can contain custom events injected
+via `custom_event_tx`. These are passed through as-is without transformation. Current custom
+event types:
+
+| Type | Source | Fields |
+|------|--------|--------|
+| `ask_user` | `AskUserTool` | `question_id`, `question`, `options` |
+
+### Dual Broadcast Channel Architecture
+
+Each chat run creates two separate broadcast channels that are merged into a single SSE stream:
+
+```
+                    ┌─────────────────────┐
+                    │   Agent Event TX    │  capacity: 256
+                    │  (AgentEventEnvelope)│
+                    └─────────┬───────────┘
+                              │ transform_event()
+                              ▼
+┌──────────────┐      ┌──────────────┐
+│ Custom Event │      │  Merged SSE  │ → Client
+│     TX       │─────►│   Stream     │
+│ (serde_json) │      └──────────────┘
+└──────────────┘
+  capacity: 64
+```
+
+- **Agent Event TX**: Carries `AgentEventEnvelope` from the agent-sdk. Transformed by `sse.rs` before sending.
+- **Custom Event TX**: Carries raw `serde_json::Value`. Passed through directly. Used by `ask_user` and other tools that need to inject events into the SSE stream without going through the agent-sdk event system.
 
 ### ask_user Protocol
 
-The `ask_user` tool sends a special chat message via `chat_tx`:
+The `ask_user` tool now sends its question payload via `custom_event_tx` directly into the SSE
+stream (if available), falling back to `chat_tx` for background/scheduled tasks:
 
 ```json
 {
@@ -791,7 +948,7 @@ The frontend should display this and POST the answer:
 
 ```
 POST /api/chat/respond
-{ "question_id": "uuid", "answer": "a.rs" }
+{ "question_id": "uuid", "response": "a.rs" }
 ```
 
 This resolves the oneshot channel in `pending_questions`, unblocking the tool.
@@ -897,6 +1054,115 @@ Implements `AgentHooks` trait (uses `#[async_trait]`):
 
 ---
 
+## Authentication
+
+### Overview
+
+The authentication system protects API routes with token-based auth using HMAC-SHA256 signed
+tokens. It is **opt-in** — disabled by default (`AUTH_ENABLED=0`). When enabled, all API
+routes except `/api/health` and `/api/auth/*` require a valid token.
+
+### Configuration
+
+```bash
+AUTH_ENABLED=1                          # Enable auth (default: 0)
+AUTH_PASSWORD=my-secret-password        # Required when auth is enabled
+AUTH_SECRET=custom-hmac-secret          # Optional — auto-derived if not set
+```
+
+If `AUTH_SECRET` is not set, it is derived as: `claw-auth-{AUTH_PASSWORD}-secret-key`
+
+### Token Format
+
+Tokens use a custom compact format: `{payloadB64url}.{signatureB64url}`
+
+```
+Payload (JSON, base64url-encoded):
+{
+  "exp": 1741234567890    // Expiration as Unix timestamp in milliseconds
+}
+
+Signature:
+HMAC-SHA256(payloadB64url, auth_secret) → base64url-encoded
+```
+
+Tokens are valid for **7 days** from issuance.
+
+### Token Verification
+
+The token is extracted from (checked in order):
+1. `claw-token` cookie
+2. `Authorization: Bearer {token}` header
+
+Verification steps:
+1. Split token at `.` → payload + signature
+2. Base64url-decode both parts
+3. Recompute HMAC-SHA256 of the payload using `auth_secret`
+4. Compare signatures (constant-time)
+5. Decode payload JSON, check `exp` > current time in milliseconds
+6. If any step fails → 401 Unauthorized
+
+### Middleware (`src/web/middleware.rs`)
+
+The `auth_middleware` function is an Axum middleware applied to the protected router layer.
+
+```rust
+pub async fn auth_middleware(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response
+```
+
+**Behavior:**
+- If `config.auth_enabled == false` → pass through (all requests allowed)
+- If `config.auth_enabled == true` → extract token from cookie or bearer header, verify, and either allow or return 401
+
+### Route Split (`src/web/server.rs`)
+
+```
+Router
+├── Public (no middleware)
+│   ├── GET  /api/health
+│   └── /api/auth/*
+│       ├── GET  /api/auth/status
+│       ├── POST /api/auth/login
+│       ├── POST /api/auth/logout
+│       └── GET  /api/auth/verify
+│
+└── Protected (auth_middleware layer)
+    ├── /api/chat/*
+    ├── /api/sessions/*
+    ├── /api/history/*
+    ├── /api/tasks/*
+    ├── /api/notifications/*
+    ├── /api/soul/*
+    ├── /api/groups/*
+    ├── /api/search
+    ├── /api/file
+    └── /api/upload
+```
+
+### Login Flow
+
+1. Client sends `POST /api/auth/login` with `{password: "..."}`
+2. Server compares password against `config.auth_password`
+3. On match: generates token (7-day expiry), sets `claw-token` cookie, returns `{ok: true, token: "..."}`
+4. On mismatch: returns 401 `{error: "Invalid password"}`
+
+### Files Modified
+
+| File | Changes |
+|------|---------|
+| `src/config.rs` | Added `auth_enabled`, `auth_password`, `auth_secret` fields to `ClawConfig` |
+| `src/web/middleware.rs` | **New file.** Auth middleware with token verification |
+| `src/web/routes/auth.rs` | Replaced stubs with real token generation and verification |
+| `src/web/server.rs` | Split router into public and protected route groups |
+| `Cargo.toml` | Added `hmac = "0.12"`, `sha2 = "0.10"`, `base64 = "0.22"` |
+| `tests/auth_tests.rs` | **New file.** 25 tests covering the auth system |
+
+---
+
 ## Configuration Reference
 
 | Variable | Default | Type | Description |
@@ -913,61 +1179,100 @@ Implements `AgentHooks` trait (uses `#[async_trait]`):
 | `SCHEDULER_POLL_INTERVAL` | `15` | Seconds | How often the scheduler polls for due tasks |
 | `MAX_CONCURRENT_TASKS` | `3` | usize | Maximum parallel task executions |
 | `AGENT_TIMEOUT` | `300` | Seconds | Agent execution timeout |
+| `AUTH_ENABLED` | `0` | 0/1 | Enable authentication (`1` = enabled, `0` = disabled) |
+| `AUTH_PASSWORD` | — | String | Password for login. Required when `AUTH_ENABLED=1` |
+| `AUTH_SECRET` | auto-derived | String | HMAC-SHA256 signing key. If not set, derived as `claw-auth-{password}-secret-key` |
 | `RUST_LOG` | `claw_agent_rs=info,tower_http=info` | Filter | tracing-subscriber env filter |
 
 ---
 
 ## Testing
 
-### Rust Integration Tests (`tests/tools_integration.rs`)
+### Test Files
 
-22 async tests that exercise all 21 tools (+ error cases) directly:
+8 test files in `tests/`:
 
-- Creates a `ClawContext` with temp directories, in-memory SQLite, and broadcast channels
-- Calls `tool.execute(&tool_ctx, input)` directly
-- Validates `ToolResult.success` and output content
-- `test_15_ask_user` uses a poll loop (100ms × 50 iterations) to handle async oneshot
+| File | Description |
+|------|-------------|
+| `tests/tools_integration.rs` | 22 async tests exercising all 21 tools + error cases directly |
+| `tests/soul_manager.rs` | SoulManager unit tests (read, write, update_section, delete) |
+| `tests/memory_manager.rs` | MemoryManager unit tests (save, recall, forget, daily_log) |
+| `tests/db_tests.rs` | SQLite CRUD tests (sessions, messages, tasks, notifications) |
+| `tests/prompt_tests.rs` | System prompt assembly tests |
+| `tests/config_tests.rs` | ClawConfig loading and defaults tests |
+| `tests/web_api.rs` | Web API integration tests (HTTP endpoints) |
+| `tests/auth_tests.rs` | 25 tests covering token generation, verification, expiration, middleware behavior, login/logout flows, cookie/bearer auth, and public vs protected route access |
+
+### Running Tests
 
 ```bash
 cargo test
 ```
 
+### Test Infrastructure
+
+- Tests create `ClawContext` instances with temp directories, in-memory SQLite, and broadcast channels
+- Tools tests call `tool.execute(&tool_ctx, input)` directly, validating `ToolResult.success` and output content
+- `test_15_ask_user` uses a poll loop (100ms x 50 iterations) to handle async oneshot
+- Web API tests use `axum::test` or direct handler invocation
+
 ---
 
 ## Key Design Decisions
 
-### 1. Native async tools (no `#[async_trait]`)
+### 1. SSE-first chat response
+
+`POST /api/chat` returns the SSE stream directly as its response body, rather than returning
+a JSON response with a `run_id` and requiring a separate `GET /stream/{run_id}` call. The
+first event in the stream is `{type: "web_session_id", web_session_id: "..."}` so the
+frontend knows which session was created/used. This eliminates the race condition between
+receiving the run_id and subscribing to events.
+
+### 2. Dual broadcast channels
+
+Each chat run creates two broadcast channels: one for `AgentEventEnvelope` (from agent-sdk)
+and one for custom `serde_json::Value` events. The agent event channel is transformed through
+`sse.rs` before being sent to the client. The custom event channel passes through raw JSON.
+Both are merged into a single SSE stream via `tokio_stream::StreamExt::merge()`.
+
+### 3. RunResult accumulation
+
+The agent runner accumulates text deltas, tool call records, and token usage as it processes
+events. This is returned as a `RunResult` struct, allowing the chat handler to persist the
+complete assistant response and metadata to the database after the run completes.
+
+### 4. Native async tools (no `#[async_trait]`)
 
 agent-sdk's `Tool` trait uses `impl Future<...> + Send` instead of `#[async_trait]`.
 This avoids the boxing overhead of async_trait. Pattern: capture `Arc`-cloned fields
 from `ctx.app` before the async block.
 
-### 2. Line-based markdown parsing (no regex lookahead)
+### 5. Line-based markdown parsing (no regex lookahead)
 
 Rust's `regex` crate doesn't support lookahead `(?=...)`. The markdown section parser
 was rewritten to use line-by-line iteration instead of regex.
 
-### 3. `lib.rs` + `main.rs` pattern
+### 6. `lib.rs` + `main.rs` pattern
 
 Created `src/lib.rs` with `pub mod` exports so integration tests can `use claw_agent_rs::*`.
 Without this, `main.rs`-only modules would be private to the binary crate.
 
-### 4. DashMap for concurrent state
+### 7. DashMap for concurrent state
 
-`active_runs`, `abort_handles`, and `pending_questions` all use `DashMap` for lock-free
-concurrent access from multiple tokio tasks.
+`active_runs`, `abort_handles`, `pending_questions`, `run_sessions`, and `custom_events`
+all use `DashMap` for lock-free concurrent access from multiple tokio tasks.
 
-### 5. dotenvy does NOT override
+### 8. dotenvy does NOT override
 
 `dotenvy::dotenv()` does not override existing env vars from the parent process.
 If `WEB_PORT=3102` is set in the parent shell, `.env`'s `WEB_PORT=3100` is ignored.
 
-### 6. Broadcast channel for SSE
+### 9. Broadcast channel for SSE
 
 Each agent run creates its own `broadcast::channel(256)`. SSE clients subscribe as
 `BroadcastStream` consumers. Lagged events (client fell behind) are silently skipped.
 
-### 7. Poll-based scheduler with Notify
+### 10. Poll-based scheduler with Notify
 
 The scheduler uses `tokio::select!` between `sleep(interval)` and `scheduler_handle.notified()`.
 This means new tasks are picked up almost instantly (via `notify_new_task()`) while the
@@ -1002,6 +1307,9 @@ poll interval handles edge cases.
 | `tracing` | 0.1 | Structured logging |
 | `tracing-subscriber` | 0.3 | Log output formatting |
 | `dotenvy` | 0.15 | .env file loading |
+| `hmac` | 0.12 | HMAC-SHA256 token signing (auth) |
+| `sha2` | 0.10 | SHA-256 digest for HMAC (auth) |
+| `base64` | 0.22 | Base64url encoding/decoding for auth tokens |
 | `async-trait` | 0.1 | AgentHooks trait |
 | `futures` | 0.3 | Stream utilities |
 | `tempfile` | 3 (dev) | Temp dirs for tests |
