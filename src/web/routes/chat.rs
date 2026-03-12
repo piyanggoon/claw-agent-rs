@@ -1,4 +1,5 @@
 use std::convert::Infallible;
+use std::sync::Arc;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -7,12 +8,14 @@ use axum::Json;
 use futures::stream::Stream;
 use serde::Deserialize;
 use serde_json::json;
+use tokio::sync::RwLock;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
+use agent_sdk::AgentEvent;
 use crate::db::{messages, sessions};
 use crate::web::sse;
-use crate::web::state::AppState;
+use crate::web::state::{AppState, RunAccumulator};
 
 // ── Request types ────────────────────────────────────────────────────────────
 
@@ -112,21 +115,81 @@ pub async fn create_chat(
     let agent_rx = event_tx.subscribe();
     let custom_rx = custom_tx.subscribe();
 
+    // Create accumulator for SSE reconnection replay
+    let accumulator = Arc::new(RwLock::new(RunAccumulator::default()));
+
     // Store in maps for status/reconnection
     state.active_runs.insert(run_id.clone(), event_tx.clone());
     state.custom_events.insert(run_id.clone(), custom_tx.clone());
     state.run_sessions.insert(run_id.clone(), session_id.clone());
+    state.run_accumulators.insert(run_id.clone(), accumulator.clone());
+
+    // Spawn accumulator task — subscribes to agent events and tracks accumulated state
+    let accum_rx = event_tx.subscribe();
+    let accum_clone = accumulator.clone();
+    tokio::spawn(async move {
+        let mut stream = BroadcastStream::new(accum_rx);
+        while let Some(Ok(envelope)) = stream.next().await {
+            let mut acc = accum_clone.write().await;
+            match &envelope.event {
+                AgentEvent::TextDelta { delta, .. } => {
+                    acc.text.push_str(delta);
+                }
+                AgentEvent::ToolCallStart { id, name, input, .. } => {
+                    // UTF-16 code units to match JavaScript's string.length
+                    let split_idx = acc.text.encode_utf16().count();
+                    let order = acc.tool_calls.len();
+                    acc.tool_calls.push(json!({
+                        "id": id,
+                        "name": name,
+                        "input": serde_json::to_string(input).unwrap_or_default(),
+                        "status": "running",
+                        "order": order,
+                        "contentSplitIndex": split_idx,
+                    }));
+                }
+                AgentEvent::ToolCallEnd { id, result, .. } => {
+                    for tc in &mut acc.tool_calls {
+                        if tc["id"].as_str() == Some(id) {
+                            tc["output"] = json!(result.output);
+                            tc["status"] = json!(if result.success { "done" } else { "error" });
+                        }
+                    }
+                }
+                AgentEvent::Done { .. } => break,
+                _ => {}
+            }
+        }
+    });
 
     // Spawn the agent loop
     let run_id_clone = run_id.clone();
     let session_id_clone = session_id.clone();
     let state_clone = state.clone();
     let model = payload.model.clone();
+    let group = payload.group.clone()
+        .unwrap_or_else(|| state.config.main_group.clone());
 
     let handle = tokio::spawn(async move {
+        // Determine soul/memory managers for the active group.
+        // If a non-default group is requested, create group-specific managers.
+        let (soul, memory) = if group != state_clone.config.main_group {
+            let group_soul_dir = state_clone.config.groups_dir.join(&group).join("soul");
+            if group_soul_dir.exists() {
+                let soul = Arc::new(crate::soul::SoulManager::new(group_soul_dir));
+                let memory = Arc::new(crate::memory::MemoryManager::new(soul.clone()));
+                (soul, memory)
+            } else {
+                tracing::warn!(group = %group, "group soul dir not found, falling back to main");
+                (state_clone.soul.clone(), state_clone.memory.clone())
+            }
+        } else {
+            (state_clone.soul.clone(), state_clone.memory.clone())
+        };
+
         let ctx = crate::context::ClawContext {
-            soul: state_clone.soul.clone(),
-            memory: state_clone.memory.clone(),
+            soul,
+            memory,
             db: state_clone.db.clone(),
             scheduler: state_clone.scheduler.clone(),
             notification_tx: state_clone.notification_tx.clone(),
@@ -134,6 +197,7 @@ pub async fn create_chat(
             pending_questions: state_clone.pending_questions.clone(),
             session_id: Some(session_id_clone.clone()),
             config: state_clone.config.clone(),
+            group: group.clone(),
             custom_event_tx: Some(custom_tx),
         };
         let thread_id = agent_sdk::ThreadId::from_string(run_id_clone.clone());
@@ -170,6 +234,7 @@ pub async fn create_chat(
         state_clone.custom_events.remove(&run_id_clone);
         state_clone.abort_handles.remove(&run_id_clone);
         state_clone.run_sessions.remove(&run_id_clone);
+        state_clone.run_accumulators.remove(&run_id_clone);
     });
 
     state.abort_handles.insert(run_id.clone(), handle.abort_handle());
@@ -214,7 +279,7 @@ pub async fn chat_status(State(state): State<AppState>) -> Json<serde_json::Valu
     Json(json!({"running": !runs.is_empty(), "runs": runs}))
 }
 
-/// GET /api/chat/stream/:run_id — SSE reconnection
+/// GET /api/chat/stream/:run_id — SSE reconnection with accumulated state replay
 pub async fn stream_events(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
@@ -223,6 +288,43 @@ pub async fn stream_events(
         .ok_or((StatusCode::NOT_FOUND, format!("run {run_id} not found")))?
         .value().clone();
 
+    // Build replay events from accumulated state
+    let mut replay_events: Vec<serde_json::Value> = Vec::new();
+    if let Some(accum_ref) = state.run_accumulators.get(&run_id) {
+        let acc = accum_ref.value().read().await;
+
+        // Replay accumulated text as a single text_delta
+        if !acc.text.is_empty() {
+            replay_events.push(json!({"type": "text_delta", "text": &acc.text}));
+        }
+
+        // Replay tool calls
+        for tc in &acc.tool_calls {
+            replay_events.push(json!({
+                "type": "tool_use_start",
+                "id": tc["id"],
+                "name": tc["name"],
+                "input": tc["input"],
+            }));
+            // If tool has completed, also emit tool_result
+            if tc["status"].as_str() != Some("running") {
+                replay_events.push(json!({
+                    "type": "tool_result",
+                    "id": tc["id"],
+                    "output": tc["output"],
+                    "is_error": tc["status"] == "error",
+                }));
+            }
+        }
+    }
+
+    // Create replay stream
+    let replay_stream = futures::stream::iter(replay_events.into_iter().map(|json| {
+        let data = serde_json::to_string(&json).unwrap_or_default();
+        Ok::<_, Infallible>(Event::default().data(data))
+    }));
+
+    // Subscribe to live agent events
     let agent_rx = event_tx.subscribe();
     let agent_stream = BroadcastStream::new(agent_rx).filter_map(|result| match result {
         Ok(envelope) => sse::transform_event(&envelope).map(|json| {
@@ -232,7 +334,29 @@ pub async fn stream_events(
         Err(_) => None,
     });
 
-    Ok(Sse::new(agent_stream))
+    // Subscribe to custom events (ask_user, etc.) — create a dummy channel if none exists
+    let custom_rx = state.custom_events.get(&run_id)
+        .map(|e| e.value().subscribe())
+        .unwrap_or_else(|| {
+            let (tx, rx) = tokio::sync::broadcast::channel::<serde_json::Value>(1);
+            drop(tx); // drop sender immediately — receiver will close
+            rx
+        });
+    let custom_stream = BroadcastStream::new(custom_rx).filter_map(|result| match result {
+        Ok(json) => {
+            let data = serde_json::to_string(&json).unwrap_or_default();
+            Some(Ok(Event::default().data(data)))
+        }
+        Err(_) => None,
+    });
+
+    let live = agent_stream.merge(custom_stream);
+
+    Ok(Sse::new(replay_stream.chain(live)).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("keep-alive"),
+    ))
 }
 
 /// POST /api/chat/respond
@@ -270,15 +394,69 @@ pub async fn stop_agent(
             .ok_or((StatusCode::NOT_FOUND, "no active runs".to_string()))?
     };
 
+    // Send synthetic "done" event through custom_events so the SSE stream
+    // gets a clean termination signal before we abort the task.
+    if let Some(custom_tx) = state.custom_events.get(&run_id) {
+        let done_event = json!({
+            "type": "done",
+            "result": null,
+            "cost_usd": 0,
+            "duration_ms": 0,
+            "num_turns": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0,
+            "stopped": true
+        });
+        let _ = custom_tx.send(done_event);
+    }
+
+    // Small yield to let the done event propagate through the stream
+    tokio::task::yield_now().await;
+
+    // Store partial assistant message from accumulator before aborting
+    if let Some(accum_ref) = state.run_accumulators.get(&run_id) {
+        let acc = accum_ref.value().read().await;
+        if !acc.text.is_empty() {
+            if let Some(session_ref) = state.run_sessions.get(&run_id) {
+                let session_id = session_ref.value().clone();
+                drop(session_ref);
+                let metadata = json!({
+                    "toolCalls": acc.tool_calls,
+                    "resultMeta": {
+                        "costUsd": 0,
+                        "durationMs": 0,
+                        "numTurns": 0,
+                        "inputTokens": 0,
+                        "outputTokens": 0,
+                        "stopped": true,
+                    }
+                });
+                let msg_id = uuid::Uuid::new_v4().to_string();
+                let db = state.db.lock().await;
+                let _ = messages::store_message(
+                    &db, &msg_id, &run_id, "assistant",
+                    &acc.text, Some(&session_id),
+                    Some(&metadata.to_string()),
+                );
+            }
+        }
+    }
+
+    // Abort the agent task
     let handle = state.abort_handles.get(&run_id)
         .ok_or((StatusCode::NOT_FOUND, format!("run {run_id} not found")))?
         .value().clone();
 
     handle.abort();
+
+    // Clean up all maps
     state.abort_handles.remove(&run_id);
     state.active_runs.remove(&run_id);
     state.custom_events.remove(&run_id);
     state.run_sessions.remove(&run_id);
+    state.run_accumulators.remove(&run_id);
 
     Ok(Json(json!({"ok": true})))
 }

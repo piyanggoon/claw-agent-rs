@@ -184,7 +184,7 @@ fn setup_db() -> rusqlite::Connection {
 }
 
 #[test]
-fn paginated_without_cursor_returns_from_start() {
+fn paginated_without_cursor_returns_most_recent() {
     let conn = setup_db();
     sessions::create_session(&conn, "s1", Some("Test")).unwrap();
 
@@ -205,10 +205,10 @@ fn paginated_without_cursor_returns_from_start() {
 
     let page = messages::get_messages_paginated(&conn, "s1", 3, None).unwrap();
     assert_eq!(page.len(), 3);
-    // Without cursor, returns ASC from the start
-    assert_eq!(page[0].content, "message 0");
-    assert_eq!(page[1].content, "message 1");
-    assert_eq!(page[2].content, "message 2");
+    // Without cursor, returns the 3 MOST RECENT messages in chronological order
+    assert_eq!(page[0].content, "message 2");
+    assert_eq!(page[1].content, "message 3");
+    assert_eq!(page[2].content, "message 4");
 }
 
 #[test]
@@ -231,14 +231,17 @@ fn paginated_with_before_cursor() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
-    // Get messages before m3 (should return messages with timestamps < m3's timestamp)
-    let page = messages::get_messages_paginated(&conn, "s1", 10, Some("m3")).unwrap();
-    // m0, m1, m2 are before m3 — returned in DESC order by the query
+    // Get timestamp of m3 to use as cursor (frontend sends timestamps, not IDs)
+    let all = messages::get_messages_by_session(&conn, "s1", Some(100), None).unwrap();
+    let m3_ts = &all[3].timestamp;
+
+    // Get messages before m3's timestamp — should return m0, m1, m2 in chronological order
+    let page = messages::get_messages_paginated(&conn, "s1", 10, Some(m3_ts)).unwrap();
     assert_eq!(page.len(), 3);
-    // The query orders DESC when using before cursor
-    assert_eq!(page[0].id, "m2");
+    // Results are in chronological order (reversed from DESC query)
+    assert_eq!(page[0].id, "m0");
     assert_eq!(page[1].id, "m1");
-    assert_eq!(page[2].id, "m0");
+    assert_eq!(page[2].id, "m2");
 }
 
 #[test]
@@ -300,7 +303,53 @@ fn paginated_before_first_message_returns_empty() {
     std::thread::sleep(std::time::Duration::from_millis(10));
     messages::store_message(&conn, "m1", "t1", "user", "second", Some("s1"), None).unwrap();
 
-    // Ask for messages before the first message — nothing should come back
-    let page = messages::get_messages_paginated(&conn, "s1", 10, Some("m0")).unwrap();
+    // Use m0's timestamp as cursor — nothing should be before the first message
+    let all = messages::get_messages_by_session(&conn, "s1", Some(100), None).unwrap();
+    let m0_ts = &all[0].timestamp;
+    let page = messages::get_messages_paginated(&conn, "s1", 10, Some(m0_ts)).unwrap();
     assert!(page.is_empty(), "nothing should be before the first message");
+}
+
+#[test]
+fn has_messages_before_works() {
+    let conn = setup_db();
+    sessions::create_session(&conn, "s1", Some("Test")).unwrap();
+
+    messages::store_message(&conn, "m0", "t1", "user", "first", Some("s1"), None).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    messages::store_message(&conn, "m1", "t1", "user", "second", Some("s1"), None).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    messages::store_message(&conn, "m2", "t1", "user", "third", Some("s1"), None).unwrap();
+
+    let all = messages::get_messages_by_session(&conn, "s1", Some(100), None).unwrap();
+
+    // Before m0 → nothing
+    assert!(!messages::has_messages_before(&conn, "s1", &all[0].timestamp).unwrap());
+    // Before m1 → m0 exists
+    assert!(messages::has_messages_before(&conn, "s1", &all[1].timestamp).unwrap());
+    // Before m2 → m0, m1 exist
+    assert!(messages::has_messages_before(&conn, "s1", &all[2].timestamp).unwrap());
+}
+
+#[test]
+fn session_stats_aggregation() {
+    let conn = setup_db();
+    sessions::create_session(&conn, "s1", Some("Stats")).unwrap();
+
+    // User message (no metadata)
+    messages::store_message(&conn, "m0", "t1", "user", "hi", Some("s1"), None).unwrap();
+
+    // Assistant message with metadata
+    let meta1 = r#"{"toolCalls":[],"resultMeta":{"costUsd":0.01,"inputTokens":500,"outputTokens":200,"numTurns":1}}"#;
+    messages::store_message(&conn, "m1", "t1", "assistant", "hello", Some("s1"), Some(meta1)).unwrap();
+
+    // Another assistant message
+    let meta2 = r#"{"toolCalls":[{"id":"t1","name":"bash"}],"resultMeta":{"costUsd":0.05,"inputTokens":1000,"outputTokens":800,"numTurns":3}}"#;
+    messages::store_message(&conn, "m2", "t1", "assistant", "done", Some("s1"), Some(meta2)).unwrap();
+
+    let (cost, input, output, turns) = messages::get_session_stats(&conn, "s1").unwrap();
+    assert!((cost - 0.06).abs() < 1e-9, "total cost: {cost}");
+    assert_eq!(input, 1500);
+    assert_eq!(output, 1000);
+    assert_eq!(turns, 4);
 }

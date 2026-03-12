@@ -81,6 +81,7 @@ fn setup_app_with_auth(auth_enabled: bool, auth_password: Option<&str>) -> (Temp
         run_sessions: Arc::new(DashMap::new()),
         custom_events: Arc::new(DashMap::new()),
         task_events_tx,
+        run_accumulators: Arc::new(DashMap::new()),
     };
 
     let router = build_router(state);

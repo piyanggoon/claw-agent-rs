@@ -60,7 +60,8 @@ fn build_test_context(tmp: &TempDir) -> (ClawContext, broadcast::Receiver<Notifi
         chat_tx,
         pending_questions,
         session_id: Some("test-session-001".to_string()),
-        config,
+        config: config.clone(),
+        group: config.main_group.clone(),
         custom_event_tx: None,
     };
 

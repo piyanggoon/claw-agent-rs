@@ -1,9 +1,13 @@
+use std::sync::Arc;
+
 use tokio::sync::broadcast;
 use agent_sdk::{
-    builder, AgentConfig, AgentEvent, AgentEventEnvelope, AgentInput, AgentRunState,
-    ThreadId, ToolContext, ToolRegistry,
+    builder, AgentCapabilities, AgentConfig, AgentEvent, AgentEventEnvelope, AgentInput,
+    AgentRunState, LocalFileSystem, ThreadId, Tool, ToolContext, ToolRegistry, ToolResult,
+    ToolTier,
+    primitive_tools::{ReadTool, WriteTool, EditTool, GlobTool, GrepTool, BashTool},
 };
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::context::ClawContext;
 use crate::db::stores::{SqliteMessageStore, SqliteStateStore};
@@ -11,6 +15,47 @@ use crate::hooks::ClawHooks;
 use crate::tools::register_all_tools;
 use crate::soul::prompt::build_system_prompt;
 use crate::agent::provider::create_provider;
+
+// ── Context adapter ─────────────────────────────────────────────────────────
+//
+// SDK primitive tools implement `Tool<()>` but our registry is
+// `ToolRegistry<ClawContext>`.  This wrapper bridges the gap by creating
+// a dummy `ToolContext<()>` before delegating to the inner tool.
+
+struct Adapt<T>(T);
+
+impl<T: Tool<()> + Send + Sync + 'static> Tool<ClawContext> for Adapt<T> {
+    type Name = T::Name;
+
+    fn name(&self) -> Self::Name {
+        self.0.name()
+    }
+
+    fn display_name(&self) -> &'static str {
+        self.0.display_name()
+    }
+
+    fn description(&self) -> &'static str {
+        self.0.description()
+    }
+
+    fn input_schema(&self) -> Value {
+        self.0.input_schema()
+    }
+
+    fn tier(&self) -> ToolTier {
+        self.0.tier()
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &ToolContext<ClawContext>,
+        input: Value,
+    ) -> anyhow::Result<ToolResult> {
+        let unit_ctx = ToolContext::new(());
+        self.0.execute(&unit_ctx, input).await
+    }
+}
 
 /// Result of an agent run with accumulated output data.
 pub struct RunResult {
@@ -40,9 +85,9 @@ pub async fn run_agent(
     let config = ctx.config.clone();
     let model_name = model.unwrap_or_else(|| config.default_model.clone());
 
-    // Build system prompt from AGENTS.md + soul files
+    // Build system prompt from AGENTS.md + soul files (using the active group)
     let agents_md_path = config.groups_dir
-        .join(&config.main_group)
+        .join(&ctx.group)
         .join("AGENTS.md");
     let system_prompt = build_system_prompt(
         &ctx.soul,
@@ -54,9 +99,21 @@ pub async fn run_agent(
     // Create provider
     let provider = create_provider(&model_name, &config);
 
-    // Create tool registry with all custom tools
+    // Create tool registry with all custom + primitive tools
     let mut tools: ToolRegistry<ClawContext> = ToolRegistry::new();
     register_all_tools(&mut tools);
+
+    // Register SDK primitive tools (Read, Write, Edit, Glob, Grep, Bash).
+    // Wrapped with Adapt<> to bridge Tool<()> → Tool<ClawContext>.
+    let fs = Arc::new(LocalFileSystem::new("/"));
+    let capabilities = AgentCapabilities::full_access();
+    tools
+        .register(Adapt(ReadTool::new(Arc::clone(&fs), capabilities.clone())))
+        .register(Adapt(WriteTool::new(Arc::clone(&fs), capabilities.clone())))
+        .register(Adapt(EditTool::new(Arc::clone(&fs), capabilities.clone())))
+        .register(Adapt(GlobTool::new(Arc::clone(&fs), capabilities.clone())))
+        .register(Adapt(GrepTool::new(Arc::clone(&fs), capabilities.clone())))
+        .register(Adapt(BashTool::new(Arc::clone(&fs), capabilities)));
 
     // Create hooks
     let hooks = ClawHooks::new(event_tx.clone());
@@ -106,12 +163,16 @@ pub async fn run_agent(
                 accumulated_text.push_str(delta);
             }
             AgentEvent::ToolCallStart { id, name, input, .. } => {
+                // contentSplitIndex must use UTF-16 code units (matching JavaScript's
+                // string.length) — NOT Rust's byte count which differs for non-ASCII.
+                let split_idx = accumulated_text.encode_utf16().count();
                 tool_calls.push(json!({
                     "id": id,
                     "name": name,
                     "input": serde_json::to_string(input).unwrap_or_default(),
                     "status": "running",
                     "order": tool_calls.len(),
+                    "contentSplitIndex": split_idx,
                 }));
             }
             AgentEvent::ToolCallEnd { id, result, .. } => {

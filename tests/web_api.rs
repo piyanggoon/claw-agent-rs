@@ -56,6 +56,7 @@ fn setup_app() -> (TempDir, axum::Router) {
         run_sessions: Arc::new(DashMap::new()),
         custom_events: Arc::new(DashMap::new()),
         task_events_tx,
+        run_accumulators: Arc::new(DashMap::new()),
     };
 
     let router = build_router(state);

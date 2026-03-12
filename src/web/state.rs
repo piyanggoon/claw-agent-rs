@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use tokio::sync::{broadcast, oneshot, Mutex};
+use tokio::sync::{broadcast, oneshot, Mutex, RwLock};
 use tokio::task::AbortHandle;
 
 use agent_sdk::AgentEventEnvelope;
@@ -10,6 +10,23 @@ use crate::context::{ChatMessageEvent, NotificationEvent};
 use crate::memory::MemoryManager;
 use crate::scheduler::SchedulerHandle;
 use crate::soul::SoulManager;
+
+/// Accumulated state for a running agent — used to replay events on SSE reconnection.
+pub struct RunAccumulator {
+    /// Text accumulated from TextDelta events.
+    pub text: String,
+    /// Tool calls accumulated during the run (with contentSplitIndex).
+    pub tool_calls: Vec<serde_json::Value>,
+}
+
+impl Default for RunAccumulator {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            tool_calls: Vec::new(),
+        }
+    }
+}
 
 /// Shared application state passed to all Axum route handlers.
 ///
@@ -62,4 +79,7 @@ pub struct AppState {
 
     /// Broadcast channel for real-time task lifecycle events (SSE to frontend).
     pub task_events_tx: broadcast::Sender<serde_json::Value>,
+
+    /// Per-run accumulated text + tool calls for SSE reconnection replay.
+    pub run_accumulators: Arc<DashMap<String, Arc<RwLock<RunAccumulator>>>>,
 }

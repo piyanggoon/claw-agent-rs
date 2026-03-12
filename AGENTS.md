@@ -38,7 +38,7 @@ every session, evolves over time, remembers past conversations, and can schedule
 
 **Key traits:**
 - Built on [bipa-app/agent-sdk](https://github.com/bipa-app/agent-sdk) (Rust)
-- 21 custom native tools executed in-process (zero IPC)
+- 27 tools: 21 custom native tools + 6 SDK primitives (Read, Write, Edit, Glob, Grep, Bash)
 - Two-layer memory: permanent (MEMORY.md) + daily logs (decay over time)
 - Poll-based task scheduler with semaphore-limited concurrency
 - Axum HTTP server with SSE streaming
@@ -189,6 +189,9 @@ pub struct ClawContext {
     pub pending_questions: Arc<DashMap<String, oneshot::Sender<String>>>,
     pub session_id: Option<String>,
     pub config: Arc<ClawConfig>,
+    /// The active group folder name (e.g. "main"). Determines which soul
+    /// files, memory, and AGENTS.md are used for this run.
+    pub group: String,
     /// Optional broadcast sender for injecting custom SSE events
     /// (e.g., ask_user questions) directly into the frontend's SSE stream.
     /// Set when running via web chat, `None` for background/scheduled tasks.
@@ -226,6 +229,8 @@ pub struct AppState {
     pub custom_events: Arc<DashMap<String, broadcast::Sender<serde_json::Value>>>,
     /// Broadcast channel for real-time task lifecycle events (SSE to frontend).
     pub task_events_tx: broadcast::Sender<serde_json::Value>,
+    /// Per-run accumulated text + tool calls for SSE reconnection replay.
+    pub run_accumulators: Arc<DashMap<String, Arc<RwLock<RunAccumulator>>>>,
 }
 ```
 
@@ -259,9 +264,11 @@ POST /api/chat
 5. Store user message in `messages` table
 6. Create two broadcast channels: `event_tx` (agent events, capacity 256) and `custom_tx` (custom events, capacity 64)
 7. **Subscribe to both channels BEFORE spawning** (to avoid missing events)
-8. Insert into `active_runs`, `custom_events`, and `run_sessions` DashMaps
-9. **Spawn tokio task** for agent execution
-10. Store `abort_handle` for cancellation
+8. Insert into `active_runs`, `custom_events`, `run_sessions`, and `run_accumulators` DashMaps
+9. **Spawn accumulator task** — subscribes to agent events, tracks accumulated text + tool calls for SSE reconnection replay
+10. **Determine group** — if `payload.group` is set and differs from main, create group-specific `SoulManager` + `MemoryManager`
+11. **Spawn tokio task** for agent execution
+12. Store `abort_handle` for cancellation
 11. Build merged SSE stream: prepend `web_session_id` event, then merge agent + custom streams
 12. **Return SSE stream directly** as the response body (not JSON — the response IS the stream)
 
@@ -271,7 +278,7 @@ Inside the spawned tokio task:
 
 1. **Build system prompt** — assembles AGENTS.md + all soul files + daily logs + datetime
 2. **Create LLM provider** — `AnthropicProvider` with the configured model
-3. **Create ToolRegistry** — registers all 21 tools
+3. **Create ToolRegistry** — registers all 21 custom tools + 6 SDK primitive tools (via `Adapt<T>` wrapper)
 4. **Create ClawHooks** — routes AgentEvents to the broadcast channel
 5. **Create SQLite stores** — `SqliteMessageStore` + `SqliteStateStore`
 6. **Build AgentConfig** — `{ system_prompt, model, max_turns: 100, streaming: true }`
@@ -296,6 +303,11 @@ The SSE stream is returned directly from `POST /api/chat`. It consists of:
 5. A keep-alive ping is sent every 15 seconds
 
 **Reconnection:** `GET /api/chat/stream/{run_id}` allows reconnecting to a running agent's event stream.
+The `RunAccumulator` replays all accumulated text (as a single `text_delta`) and tool calls
+(as `tool_use_start` + `tool_result` pairs) before switching to the live stream.
+
+**Stop behavior:** `POST /api/chat/stop` sends a synthetic `done` event via `custom_events`,
+stores the partial assistant message from the accumulator, then aborts the tokio task and cleans up all maps.
 
 ### 5. RunResult (`agent/runner.rs`)
 
@@ -413,22 +425,35 @@ impl Tool<ClawContext> for MyTool {
 
 ### Tool Registration
 
-All 21 tools are registered in `tools/mod.rs::register_all_tools()`:
+21 custom tools are registered in `tools/mod.rs::register_all_tools()`.
+6 SDK primitive tools are registered in `agent/runner.rs::run_agent()` via the `Adapt<T>` wrapper:
 
 ```rust
+// Custom tools (tools/mod.rs)
 pub fn register_all_tools(registry: &mut ToolRegistry<ClawContext>) {
     registry.register(soul::SoulReadTool);
     registry.register(soul::SoulUpdateTool);
-    // ... all 21 tools
+    // ... all 21 custom tools
     registry.register(utility::CodeExecuteTool);
 }
+
+// SDK primitive tools (agent/runner.rs) — bridged from Tool<()> to Tool<ClawContext>
+let fs = Arc::new(LocalFileSystem::new("/"));
+let capabilities = AgentCapabilities::full_access();
+tools
+    .register(Adapt(ReadTool::new(Arc::clone(&fs), capabilities.clone())))
+    .register(Adapt(WriteTool::new(Arc::clone(&fs), capabilities.clone())))
+    .register(Adapt(EditTool::new(Arc::clone(&fs), capabilities.clone())))
+    .register(Adapt(GlobTool::new(Arc::clone(&fs), capabilities.clone())))
+    .register(Adapt(GrepTool::new(Arc::clone(&fs), capabilities.clone())))
+    .register(Adapt(BashTool::new(Arc::clone(&fs), capabilities)));
 ```
 
 ### Tool Tiers
 
 | Tier | Behavior | Tools |
 |------|----------|-------|
-| `Observe` | Auto-allowed by hooks | 20 tools |
+| `Observe` | Auto-allowed by hooks | 26 tools (20 custom + 6 SDK primitives) |
 | `Confirm` | Can require user confirmation | `code_execute` |
 
 Currently, `ClawHooks::pre_tool_use()` returns `ToolDecision::Allow` for all tiers
@@ -1190,18 +1215,21 @@ Router
 
 ### Test Files
 
-8 test files in `tests/`:
+11 test files in `tests/`, 240 total tests:
 
-| File | Description |
-|------|-------------|
-| `tests/tools_integration.rs` | 22 async tests exercising all 21 tools + error cases directly |
-| `tests/soul_manager.rs` | SoulManager unit tests (read, write, update_section, delete) |
-| `tests/memory_manager.rs` | MemoryManager unit tests (save, recall, forget, daily_log) |
-| `tests/db_tests.rs` | SQLite CRUD tests (sessions, messages, tasks, notifications) |
-| `tests/prompt_tests.rs` | System prompt assembly tests |
-| `tests/config_tests.rs` | ClawConfig loading and defaults tests |
-| `tests/web_api.rs` | Web API integration tests (HTTP endpoints) |
-| `tests/auth_tests.rs` | 25 tests covering token generation, verification, expiration, middleware behavior, login/logout flows, cookie/bearer auth, and public vs protected route access |
+| File | Count | Description |
+|------|-------|-------------|
+| `tests/web_api_extended.rs` | 52 | Extended web API tests (groups, history, sessions, notifications, tasks, soul, search, upload) |
+| `tests/scheduler_tests.rs` | 27 | Scheduler timing + pagination (ordering, cursor, has_messages_before, session_stats) |
+| `tests/auth_tests.rs` | 25 | Token generation/verification, middleware, login/logout, cookie/bearer auth, public vs protected routes |
+| `tests/db_tests.rs` | 25 | SQLite CRUD (sessions, messages, tasks, notifications) |
+| `tests/sse_tests.rs` | 23 | SSE event transformation (agent events → frontend JSON) |
+| `tests/tools_integration.rs` | 22 | Async tool execution for all 21 custom tools + error cases |
+| `tests/soul_manager.rs` | 16 | SoulManager I/O (read, write, update_section, delete, daily_logs) |
+| `tests/memory_manager.rs` | 14 | MemoryManager (save, recall, forget, daily_log) |
+| `tests/web_api.rs` | 10 | Core web API endpoints (health, chat, soul) |
+| `tests/prompt_tests.rs` | 7 | System prompt assembly (soul files, AGENTS.md, daily logs, bootstrap) |
+| `tests/config_tests.rs` | 3 | ClawConfig loading and defaults |
 
 ### Running Tests
 
@@ -1277,6 +1305,38 @@ Each agent run creates its own `broadcast::channel(256)`. SSE clients subscribe 
 The scheduler uses `tokio::select!` between `sleep(interval)` and `scheduler_handle.notified()`.
 This means new tasks are picked up almost instantly (via `notify_new_task()`) while the
 poll interval handles edge cases.
+
+### 11. RunAccumulator for SSE reconnection
+
+Each chat run spawns a separate accumulator task that subscribes to the broadcast channel
+and tracks accumulated text + tool calls. On SSE reconnection (`GET /api/chat/stream/{run_id}`),
+the accumulated state is replayed before switching to the live stream.
+
+### 12. UTF-16 contentSplitIndex
+
+`contentSplitIndex` (used by the frontend to split text around tool calls) must use UTF-16
+code units (`str.encode_utf16().count()`) to match JavaScript's `string.length`. Rust's
+`String::len()` returns UTF-8 bytes which differs significantly for non-ASCII text
+(e.g., Thai "สวัสดี" = 18 bytes but 6 UTF-16 code units).
+
+### 13. Adapt<T> wrapper for SDK primitive tools
+
+SDK primitive tools implement `Tool<()>` but our registry is `ToolRegistry<ClawContext>`.
+The `Adapt<T>` wrapper in `runner.rs` bridges the gap by creating a dummy `ToolContext<()>`
+before delegating to the inner tool. This avoids modifying the SDK.
+
+### 14. Dynamic group selection per chat request
+
+When `payload.group` differs from `config.main_group`, `create_chat` creates temporary
+`SoulManager` and `MemoryManager` instances pointing to that group's soul directory.
+These are passed through `ClawContext` so the agent reads the correct soul files,
+memory, and AGENTS.md for the selected group.
+
+### 15. Pagination with DESC + reverse
+
+`get_messages_paginated` uses `ORDER BY timestamp DESC LIMIT N` then `messages.reverse()`
+to get the most recent N messages in chronological order. The `before` cursor is an ISO
+timestamp (not a message ID) to match what the frontend sends.
 
 ---
 

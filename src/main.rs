@@ -107,6 +107,7 @@ async fn main() -> anyhow::Result<()> {
         run_sessions: Arc::new(dashmap::DashMap::new()),
         custom_events: Arc::new(dashmap::DashMap::new()),
         task_events_tx: task_events_tx.clone(),
+        run_accumulators: Arc::new(dashmap::DashMap::new()),
     };
 
     // Start task scheduler

@@ -83,6 +83,7 @@ fn setup_app() -> (TempDir, axum::Router, Arc<Mutex<rusqlite::Connection>>) {
         run_sessions: Arc::new(DashMap::new()),
         custom_events: Arc::new(DashMap::new()),
         task_events_tx,
+        run_accumulators: Arc::new(DashMap::new()),
     };
 
     let router = build_router(state);
@@ -1314,6 +1315,7 @@ async fn chat_status_with_active_run() {
         run_sessions,
         custom_events: Arc::new(DashMap::new()),
         task_events_tx,
+        run_accumulators: Arc::new(DashMap::new()),
     };
 
     let router = build_router(state);

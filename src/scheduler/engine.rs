@@ -120,6 +120,7 @@ impl TaskScheduler {
             pending_questions,
             session_id: None,
             config: self.config.clone(),
+            group: self.config.main_group.clone(),
             custom_event_tx: None,
         };
 

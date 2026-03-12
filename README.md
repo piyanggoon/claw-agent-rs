@@ -25,10 +25,11 @@ A personal AI companion backend built in Rust, powered by [agent-sdk](https://gi
     └─────┬─────┘
           │
     ┌─────▼─────────────────────────────────────────┐
-    │                 21 Custom Tools                │
+    │              27 Tools (21 Custom + 6 SDK)       │
     │                                               │
     │  Soul (4)  Memory (4)  Heartbeat (2)          │
     │  Tasks (5)  Utility (6)                       │
+    │  SDK Primitives: Read Write Edit Glob Grep Bash│
     └──────────────────────────┬────────────────────┘
                                │
                         ┌──────▼──────┐
@@ -41,12 +42,13 @@ A personal AI companion backend built in Rust, powered by [agent-sdk](https://gi
 
 - **Persistent Soul** — Identity, personality, and memories live in `.md` files that the agent reads and updates
 - **Two-layer Memory** — Core memories (MEMORY.md, never decay) + daily logs (YYYY-MM-DD.md, fade over time)
-- **21 Custom Tools** — Soul management, memory, heartbeat, task scheduling, notifications, code execution, web fetch
+- **27 Tools** — 21 custom tools (soul, memory, heartbeat, tasks, utility) + 6 SDK primitives (Read, Write, Edit, Glob, Grep, Bash)
 - **Real-time Streaming** — POST /api/chat returns SSE directly; events stream token-by-token with tool call progress
+- **SSE Reconnection** — RunAccumulator tracks accumulated state; reconnecting clients get full replay of text + tool calls
 - **Task Scheduler** — Cron, interval, once, and delay schedules with poll-based execution and real-time SSE events
-- **Multi-group Support** — Each group has its own soul files; new groups auto-copy from `groups/default/`
+- **Multi-group Support** — Each group has its own soul files, memory, and AGENTS.md; dynamically selected per chat request
 - **Multi-provider Ready** — Architecture supports Anthropic, OpenAI, and Google (Anthropic implemented)
-- **SQLite Storage** — Sessions, messages, tasks, notifications all persisted
+- **SQLite Storage** — Sessions, messages, tasks, notifications all persisted with proper pagination
 
 ## Quick Start
 
@@ -157,9 +159,12 @@ claw-agent-rs/
 │           ├── search.rs     # GET /api/search
 │           └── files.rs      # GET /api/file, POST /api/upload
 ├── tests/
-│   ├── tools_integration.rs  # 22 tool tests
-│   ├── db_tests.rs           # 25 database tests
+│   ├── web_api_extended.rs   # 52 extended web API tests
+│   ├── scheduler_tests.rs    # 27 scheduler + pagination tests
 │   ├── auth_tests.rs         # 25 auth tests
+│   ├── db_tests.rs           # 25 database tests
+│   ├── sse_tests.rs          # 23 SSE event tests
+│   ├── tools_integration.rs  # 22 tool tests
 │   ├── soul_manager.rs       # 16 soul manager tests
 │   ├── memory_manager.rs     # 14 memory manager tests
 │   ├── web_api.rs            # 10 web API tests
@@ -221,7 +226,7 @@ The first SSE event is always `{"type": "web_session_id", "web_session_id": "...
 |-------|-------------|
 | `limit` | Max messages to return (default: 100) |
 | `session` | Filter by session ID |
-| `before` | Cursor for pagination (message ID) |
+| `before` | Cursor for pagination (ISO timestamp) |
 | `date` | Alias for session |
 | `paginate` | Pagination mode |
 
@@ -389,7 +394,9 @@ Events streamed from `GET /api/tasks/events`:
 {"type": "task_deleted", "task_id": "...", "timestamp": "..."}
 ```
 
-## Custom Tools (21)
+## Tools (27)
+
+### Custom Tools (21)
 
 | Category | Tool | Description |
 |----------|------|-------------|
@@ -414,6 +421,19 @@ Events streamed from `GET /api/tasks/events`:
 | | `run_background` | Spawn background agent task |
 | | `web_fetch` | HTTP GET → markdown |
 | | `code_execute` | Run bash/python/javascript |
+
+### SDK Primitive Tools (6)
+
+Provided by agent-sdk, bridged to `ClawContext` via `Adapt<T>` wrapper:
+
+| Tool | Description |
+|------|-------------|
+| `read` | Read file contents (text, images, PDFs) |
+| `write` | Create or overwrite files |
+| `edit` | String-replacement editing of existing files |
+| `glob` | Find files by glob pattern |
+| `grep` | Search file contents with regex |
+| `bash` | Execute shell commands |
 
 ## Configuration
 
@@ -441,19 +461,22 @@ All settings via environment variables (`.env` file supported):
 ## Testing
 
 ```bash
-# Run all tests — 8 test files, 238 tests
+# Run all tests — 11 test files, 240 tests
 cargo test
 
 # Test files:
-#   tools_integration.rs  — 22 tool unit tests
+#   web_api_extended.rs   — 52 extended web API tests
+#   scheduler_tests.rs    — 27 scheduler + pagination tests
+#   auth_tests.rs         — 25 authentication tests
 #   db_tests.rs           — 25 database CRUD tests
-#   auth_tests.rs         — 25 authentication tests (login, token, middleware, cookie/header)
+#   sse_tests.rs          — 23 SSE event transformer tests
+#   tools_integration.rs  — 22 tool unit tests
 #   soul_manager.rs       — 16 soul file I/O tests
 #   memory_manager.rs     — 14 memory manager tests
 #   web_api.rs            — 10 web API endpoint tests
 #   prompt_tests.rs       — 7 system prompt builder tests
 #   config_tests.rs       — 3 configuration tests
-#   + 4 inline tests in src/soul/markdown.rs
+#   + 16 inline unit tests in src/
 ```
 
 ## Multi-Group Support

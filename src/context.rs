@@ -42,6 +42,9 @@ pub struct ClawContext {
     /// The web session that initiated the current agent run, if any.
     pub session_id: Option<String>,
     pub config: Arc<ClawConfig>,
+    /// The active group folder name (e.g. "main"). Determines which soul
+    /// files, memory, and AGENTS.md are used for this run.
+    pub group: String,
     /// Optional broadcast sender for injecting custom SSE events
     /// (e.g., ask_user questions) directly into the frontend's SSE stream.
     /// Set when running via web chat, `None` for background/scheduled tasks.

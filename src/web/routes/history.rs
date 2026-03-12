@@ -17,6 +17,14 @@ pub struct HistoryQuery {
 }
 
 /// GET /api/history
+///
+/// Returns messages for a session. The `metadata` field is returned as a raw
+/// JSON string so the frontend can parse it with `JSON.parse(m.metadata)`.
+///
+/// - Without `before`: Returns the N most recent messages.
+/// - With `before` (ISO timestamp): Returns N messages older than `before`.
+/// - `hasMore`: true if there are older messages to load.
+/// - `sessionStats`: aggregated from ALL messages in the session (not just the page).
 pub async fn get_history(
     State(state): State<AppState>,
     Query(params): Query<HistoryQuery>,
@@ -42,34 +50,48 @@ pub async fn get_history(
         0
     };
 
-    let has_more = msgs.len() == limit as usize;
+    // Check if there are older messages (for "load more" / infinite scroll)
+    let has_more = if !msgs.is_empty() {
+        if let Some(sid) = &session_id {
+            let oldest_ts = &msgs[0].timestamp; // msgs are chronological (oldest first)
+            messages::has_messages_before(&db, sid, oldest_ts).unwrap_or(false)
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    // Session stats from ALL messages (not just the current page)
+    let (total_cost, total_input, total_output, turns) = if let Some(sid) = &session_id {
+        messages::get_session_stats(&db, sid).unwrap_or((0.0, 0, 0, 0))
+    } else {
+        (0.0, 0, 0, 0)
+    };
 
     let formatted: Vec<serde_json::Value> = msgs.iter().map(|m| {
-        let mut msg = json!({
+        // Return message with metadata as raw JSON string (frontend parses it)
+        json!({
             "id": m.id,
             "role": m.role,
             "content": m.content,
             "timestamp": m.timestamp,
             "web_session_id": m.web_session_id,
-        });
-        if let Some(meta) = &m.metadata {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(meta) {
-                // Merge metadata fields into the message
-                if let Some(tool_calls) = parsed.get("toolCalls") {
-                    msg["toolCalls"] = tool_calls.clone();
-                }
-                if let Some(result_meta) = parsed.get("resultMeta") {
-                    msg["resultMeta"] = result_meta.clone();
-                }
-            }
-        }
-        msg
+            "metadata": m.metadata,
+        })
     }).collect();
 
     Ok(Json(json!({
         "messages": formatted,
         "hasMore": has_more,
         "total": total,
+        "sessionStats": {
+            "totalCost": total_cost,
+            "totalInput": total_input,
+            "totalOutput": total_output,
+            "turns": turns,
+            "lastModel": null,
+        }
     })))
 }
 
