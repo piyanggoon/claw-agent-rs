@@ -42,6 +42,8 @@ async fn main() -> anyhow::Result<()> {
     let conn = rusqlite::Connection::open(&db_path)?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
     db::schema::initialize_db(&conn)?;
+    // Migrate old RFC 3339 timestamps (+00:00) to JS-compatible format (Z)
+    db::messages::migrate_timestamps(&conn)?;
     let db = Arc::new(Mutex::new(conn));
     tracing::info!(path = %db_path.display(), "Database initialized");
 

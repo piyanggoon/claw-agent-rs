@@ -10,8 +10,8 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent-sdk"
-version = "0.5.6"
-source = "git+https://github.com/bipa-app/agent-sdk?branch=main#ab820e7b39a2fc778b312fcf317f40cbdfc7459d"
+version = "0.5.7"
+source = "git+https://github.com/bipa-app/agent-sdk?branch=main#83c8eb6c9809ecc2c09e75a359b376b2654d27f0"
 dependencies = [
  "anyhow",
  "async-stream",

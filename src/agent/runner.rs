@@ -49,10 +49,15 @@ impl<T: Tool<()> + Send + Sync + 'static> Tool<ClawContext> for Adapt<T> {
 
     async fn execute(
         &self,
-        _ctx: &ToolContext<ClawContext>,
+        ctx: &ToolContext<ClawContext>,
         input: Value,
     ) -> anyhow::Result<ToolResult> {
-        let unit_ctx = ToolContext::new(());
+        // Build a ToolContext<()> and forward event_tx + event_seq so that
+        // SDK tools (including SubagentTool) can emit events to the parent stream.
+        let mut unit_ctx = ToolContext::new(());
+        if let (Some(tx), Some(seq)) = (ctx.event_tx(), ctx.event_seq()) {
+            unit_ctx = unit_ctx.with_event_tx(tx, seq);
+        }
         self.0.execute(&unit_ctx, input).await
     }
 }

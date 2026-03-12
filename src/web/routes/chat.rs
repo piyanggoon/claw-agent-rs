@@ -200,7 +200,7 @@ pub async fn create_chat(
             group: group.clone(),
             custom_event_tx: Some(custom_tx),
         };
-        let thread_id = agent_sdk::ThreadId::from_string(run_id_clone.clone());
+        let thread_id = agent_sdk::ThreadId::from_string(session_id_clone.clone());
         let result = crate::agent::runner::run_agent(ctx, thread_id, message_text, model, event_tx).await;
 
         // Store assistant message with metadata

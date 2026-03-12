@@ -3,6 +3,7 @@ pub mod memory;
 pub mod heartbeat;
 pub mod tasks;
 pub mod utility;
+pub mod subagent;
 
 use agent_sdk::ToolRegistry;
 use crate::context::ClawContext;
@@ -34,4 +35,6 @@ pub fn register_all_tools(registry: &mut ToolRegistry<ClawContext>) {
     registry.register(utility::RunBackgroundTool);
     registry.register(utility::WebFetchTool);
     registry.register(utility::CodeExecuteTool);
+    // Subagent tool
+    registry.register(subagent::SubagentTool);
 }

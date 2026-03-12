@@ -25,7 +25,7 @@ A personal AI companion backend built in Rust, powered by [agent-sdk](https://gi
     └─────┬─────┘
           │
     ┌─────▼─────────────────────────────────────────┐
-    │              27 Tools (21 Custom + 6 SDK)       │
+    │              28 Tools (22 Custom + 6 SDK)       │
     │                                               │
     │  Soul (4)  Memory (4)  Heartbeat (2)          │
     │  Tasks (5)  Utility (6)                       │
@@ -42,7 +42,7 @@ A personal AI companion backend built in Rust, powered by [agent-sdk](https://gi
 
 - **Persistent Soul** — Identity, personality, and memories live in `.md` files that the agent reads and updates
 - **Two-layer Memory** — Core memories (MEMORY.md, never decay) + daily logs (YYYY-MM-DD.md, fade over time)
-- **27 Tools** — 21 custom tools (soul, memory, heartbeat, tasks, utility) + 6 SDK primitives (Read, Write, Edit, Glob, Grep, Bash)
+- **28 Tools** — 22 custom tools (soul, memory, heartbeat, tasks, utility, subagent) + 6 SDK primitives (Read, Write, Edit, Glob, Grep, Bash)
 - **Real-time Streaming** — POST /api/chat returns SSE directly; events stream token-by-token with tool call progress
 - **SSE Reconnection** — RunAccumulator tracks accumulated state; reconnecting clients get full replay of text + tool calls
 - **Task Scheduler** — Cron, interval, once, and delay schedules with poll-based execution and real-time SSE events
@@ -141,7 +141,8 @@ claw-agent-rs/
 │   │   ├── memory.rs         # memory_save, memory_daily_log, memory_recall, memory_forget
 │   │   ├── heartbeat.rs      # heartbeat_read, heartbeat_update
 │   │   ├── tasks.rs          # schedule_task, list_tasks, pause_task, resume_task, cancel_task
-│   │   └── utility.rs        # send_notification, send_chat_message, ask_user, run_background, web_fetch, code_execute
+│   │   ├── utility.rs        # send_notification, send_chat_message, ask_user, run_background, web_fetch, code_execute
+│   │   └── subagent.rs       # run_subagent (isolated child agent with SDK tools)
 │   └── web/
 │       ├── server.rs         # Axum router & startup
 │       ├── state.rs          # AppState
@@ -394,9 +395,9 @@ Events streamed from `GET /api/tasks/events`:
 {"type": "task_deleted", "task_id": "...", "timestamp": "..."}
 ```
 
-## Tools (27)
+## Tools (28)
 
-### Custom Tools (21)
+### Custom Tools (22)
 
 | Category | Tool | Description |
 |----------|------|-------------|
@@ -421,6 +422,7 @@ Events streamed from `GET /api/tasks/events`:
 | | `run_background` | Spawn background agent task |
 | | `web_fetch` | HTTP GET → markdown |
 | | `code_execute` | Run bash/python/javascript |
+| **Subagent** | `run_subagent` | Spawn isolated child agent with SDK tools |
 
 ### SDK Primitive Tools (6)
 

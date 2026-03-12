@@ -331,6 +331,138 @@ fn has_messages_before_works() {
     assert!(messages::has_messages_before(&conn, "s1", &all[2].timestamp).unwrap());
 }
 
+/// Regression: new-format timestamps (%.3fZ) must not produce duplicates.
+/// Frontend sends `new Date(ts).toISOString()` which is identical to the
+/// stored format, so `<` comparison excludes the cursor message correctly.
+#[test]
+fn paginated_cursor_no_duplicate_with_js_format() {
+    let conn = setup_db();
+    sessions::create_session(&conn, "s1", Some("Test")).unwrap();
+
+    for i in 0..5 {
+        messages::store_message(
+            &conn,
+            &format!("m{i}"),
+            "t1",
+            "user",
+            &format!("msg {i}"),
+            Some("s1"),
+            None,
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // Load initial page (most recent 3)
+    let page1 = messages::get_messages_paginated(&conn, "s1", 3, None).unwrap();
+    assert_eq!(page1.len(), 3);
+    let oldest = &page1[0]; // This is the cursor boundary
+
+    // Simulate frontend: new Date(ts).toISOString()
+    let js_cursor = {
+        let dt = chrono::DateTime::parse_from_rfc3339(&oldest.timestamp).unwrap();
+        dt.with_timezone(&chrono::Utc)
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string()
+    };
+
+    // Load older messages
+    let page2 = messages::get_messages_paginated(&conn, "s1", 10, Some(&js_cursor)).unwrap();
+    for m in &page2 {
+        assert_ne!(m.id, oldest.id, "cursor message must not appear in next page");
+    }
+    assert_eq!(page2.len(), 2, "should return the 2 messages older than cursor");
+
+    // has_messages_before must also NOT count the cursor message itself
+    assert!(!messages::has_messages_before(&conn, "s1", &page2[0].timestamp).unwrap(),
+        "nothing should be before the very first message");
+}
+
+/// Regression: has_messages_before must stop returning true once all older
+/// messages have been loaded (no infinite loop).
+#[test]
+fn has_messages_before_does_not_cause_infinite_loop() {
+    let conn = setup_db();
+    sessions::create_session(&conn, "s1", Some("Test")).unwrap();
+
+    for i in 0..3 {
+        messages::store_message(
+            &conn,
+            &format!("m{i}"),
+            "t1",
+            "user",
+            &format!("msg {i}"),
+            Some("s1"),
+            None,
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // Simulate full pagination flow:
+    // Page 1: get most recent 2
+    let page1 = messages::get_messages_paginated(&conn, "s1", 2, None).unwrap();
+    assert_eq!(page1.len(), 2); // m1, m2
+    let has_more_1 = messages::has_messages_before(&conn, "s1", &page1[0].timestamp).unwrap();
+    assert!(has_more_1, "should have more messages before page 1");
+
+    // Page 2: use oldest from page1 as cursor (as frontend would via JS Date)
+    let cursor = {
+        let dt = chrono::DateTime::parse_from_rfc3339(&page1[0].timestamp).unwrap();
+        dt.with_timezone(&chrono::Utc)
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string()
+    };
+    let page2 = messages::get_messages_paginated(&conn, "s1", 10, Some(&cursor)).unwrap();
+    assert_eq!(page2.len(), 1); // m0
+    let has_more_2 = messages::has_messages_before(&conn, "s1", &page2[0].timestamp).unwrap();
+    assert!(!has_more_2, "no messages before the first message — pagination must stop");
+}
+
+/// migrate_timestamps converts old +00:00 format to JS Z format.
+#[test]
+fn migrate_timestamps_converts_old_format() {
+    let conn = setup_db();
+    sessions::create_session(&conn, "s1", Some("Test")).unwrap();
+
+    // Manually insert messages with OLD format timestamps (simulating pre-fix data)
+    let old_ts_1 = "2026-01-01T10:00:00.123456789+00:00";
+    let old_ts_2 = "2026-01-01T10:00:01.987654321+00:00";
+    let new_ts = "2026-01-01T10:00:02.500Z"; // already new format
+    conn.execute(
+        "INSERT INTO messages (id, thread_id, role, content, timestamp, web_session_id) VALUES (?1,?2,?3,?4,?5,?6)",
+        rusqlite::params!["m0", "t1", "user", "old 1", old_ts_1, "s1"],
+    ).unwrap();
+    conn.execute(
+        "INSERT INTO messages (id, thread_id, role, content, timestamp, web_session_id) VALUES (?1,?2,?3,?4,?5,?6)",
+        rusqlite::params!["m1", "t1", "user", "old 2", old_ts_2, "s1"],
+    ).unwrap();
+    conn.execute(
+        "INSERT INTO messages (id, thread_id, role, content, timestamp, web_session_id) VALUES (?1,?2,?3,?4,?5,?6)",
+        rusqlite::params!["m2", "t1", "user", "new", new_ts, "s1"],
+    ).unwrap();
+
+    // Run migration
+    let migrated = messages::migrate_timestamps(&conn).unwrap();
+    assert_eq!(migrated, 2, "should migrate the 2 old-format timestamps");
+
+    // Verify timestamps are now in JS format
+    let all = messages::get_messages_by_session(&conn, "s1", Some(100), None).unwrap();
+    assert_eq!(all[0].timestamp, "2026-01-01T10:00:00.123Z");
+    assert_eq!(all[1].timestamp, "2026-01-01T10:00:01.987Z"); // truncated from .987654
+    assert_eq!(all[2].timestamp, "2026-01-01T10:00:02.500Z"); // unchanged
+
+    // Idempotent — running again migrates 0
+    let migrated2 = messages::migrate_timestamps(&conn).unwrap();
+    assert_eq!(migrated2, 0, "should be idempotent");
+
+    // Pagination with JS cursor should now work correctly
+    let cursor = "2026-01-01T10:00:01.988Z"; // m1's new timestamp
+    let page = messages::get_messages_paginated(&conn, "s1", 10, Some(cursor)).unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].id, "m0", "should return only m0 before the cursor");
+}
+
 #[test]
 fn session_stats_aggregation() {
     let conn = setup_db();

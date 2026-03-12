@@ -1,6 +1,16 @@
 use anyhow::Result;
+use chrono::Utc;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+
+/// Format a UTC timestamp as JavaScript-compatible ISO string (`%.3fZ`).
+///
+/// This matches `new Date().toISOString()` exactly — millisecond precision
+/// with a `Z` suffix — so that SQLite string comparison works correctly
+/// when the frontend sends a `before` cursor for pagination.
+fn js_iso_now() -> String {
+    Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredMessage {
@@ -22,7 +32,7 @@ pub fn store_message(
     web_session_id: Option<&str>,
     metadata: Option<&str>,
 ) -> Result<()> {
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = js_iso_now();
     conn.execute(
         "INSERT INTO messages (id, thread_id, role, content, timestamp, metadata, web_session_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![id, thread_id, role, content, now, metadata, web_session_id],
@@ -92,6 +102,29 @@ pub fn delete_messages_by_session(conn: &Connection, web_session_id: &str) -> Re
     Ok(())
 }
 
+/// Normalize a timestamp cursor to the JS-compatible format (`%.3fZ`).
+///
+/// The frontend sends cursors via `new Date(ts).toISOString()` which produces
+/// `2026-03-12T08:00:00.123Z`.  However, messages stored before this fix used
+/// `chrono::to_rfc3339()` format: `2026-03-12T08:00:00.123456789+00:00`.
+///
+/// Without normalisation, SQLite string comparison can include the cursor
+/// message itself (because `"...123456789+00:00" < "...123Z"` in ASCII).
+///
+/// This function parses any valid RFC 3339 / ISO 8601 string and re-formats
+/// it to JS-compatible `%.3fZ`, ensuring a correct `<` boundary.
+fn normalize_cursor(ts: &str) -> String {
+    // Try to parse with chrono (handles both `Z` and `+00:00` variants)
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
+        dt.with_timezone(&Utc)
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string()
+    } else {
+        // Fallback: return as-is (shouldn't happen in practice)
+        ts.to_string()
+    }
+}
+
 /// Get paginated messages for a session.
 ///
 /// - Without `before`: Returns the N most recent messages in chronological order.
@@ -107,6 +140,8 @@ pub fn get_messages_paginated(
     before: Option<&str>,
 ) -> Result<Vec<StoredMessage>> {
     let (sql, params_vec): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(before_ts) = before {
+        // Normalise cursor so that string comparison matches our stored format.
+        let cursor = normalize_cursor(before_ts);
         // Cursor-based: get N messages older than the given timestamp
         (
             "SELECT id, thread_id, role, content, timestamp, metadata, web_session_id \
@@ -114,7 +149,7 @@ pub fn get_messages_paginated(
              ORDER BY timestamp DESC LIMIT ?3",
             vec![
                 Box::new(web_session_id.to_string()),
-                Box::new(before_ts.to_string()),
+                Box::new(cursor),
                 Box::new(limit),
             ],
         )
@@ -152,6 +187,11 @@ pub fn get_messages_paginated(
 }
 
 /// Check if there are messages older than the given timestamp in a session.
+///
+/// NOTE: `before_ts` is typically a **raw DB timestamp** passed from the
+/// history route (e.g. `msgs[0].timestamp`).  Do NOT normalize it — the
+/// raw value is already in the same format as other stored timestamps, so
+/// string comparison works correctly.
 pub fn has_messages_before(
     conn: &Connection,
     web_session_id: &str,
@@ -163,6 +203,42 @@ pub fn has_messages_before(
         |row| row.get(0),
     )?;
     Ok(count > 0)
+}
+
+/// Migrate old RFC 3339 timestamps (`+00:00` suffix) to JS-compatible format (`Z` suffix).
+///
+/// Old `chrono::to_rfc3339()` produced `2026-03-12T08:00:00.123456789+00:00`.
+/// New `js_iso_now()` produces `2026-03-12T08:00:00.123Z`.
+///
+/// This is idempotent — once all timestamps end with `Z`, the query matches
+/// zero rows and does nothing.  Called at app startup.
+pub fn migrate_timestamps(conn: &Connection) -> Result<usize> {
+    let mut stmt = conn.prepare(
+        "SELECT id, timestamp FROM messages WHERE timestamp LIKE '%+00:00'",
+    )?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let count = rows.len();
+    if count > 0 {
+        for (id, ts) in &rows {
+            let new_ts = if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
+                dt.with_timezone(&Utc)
+                    .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                    .to_string()
+            } else {
+                continue;
+            };
+            conn.execute(
+                "UPDATE messages SET timestamp = ?1 WHERE id = ?2",
+                params![new_ts, id],
+            )?;
+        }
+        tracing::info!(migrated = count, "migrated old RFC 3339 timestamps to JS format");
+    }
+    Ok(count)
 }
 
 pub fn count_messages(conn: &Connection, web_session_id: &str) -> Result<u32> {
